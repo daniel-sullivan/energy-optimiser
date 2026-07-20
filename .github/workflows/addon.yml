@@ -36,7 +36,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add ha-addon/config.yaml
           git diff --cached --quiet || git commit -m "Release ${GITHUB_REF_NAME}: update add-on version"
-          git push origin HEAD:master
+          git push origin HEAD:main
 
       - name: Create GitHub release
         env:
