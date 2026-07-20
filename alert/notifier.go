@@ -21,6 +21,7 @@ type Notifier struct {
 	rates     config.Rates
 	site      string
 	currency  string
+	capacity  float64
 	slotHours float64
 	resolveIn time.Duration
 	riskSOC   float64
@@ -56,6 +57,7 @@ func NewNotifier(cfg *config.Config) *Notifier {
 		rates:     cfg.Rates,
 		site:      site,
 		currency:  cfg.Rates.Currency,
+		capacity:  cfg.Battery.CapacityKWh,
 		slotHours: slot,
 		resolveIn: 3 * poll,
 		riskSOC:   riskSOC,
@@ -102,19 +104,38 @@ func (n *Notifier) alert(name, severity, summary string, now time.Time) Alert {
 }
 
 // chargeAlert fires while a grid-charge is planned — including the slot in
-// progress (slot end after now), so it does not falsely resolve mid-charge.
+// progress (slot end after now), so it does not falsely resolve mid-charge. The
+// summary reports the energy the imminent charge run adds to the battery (the
+// SoC gain across the contiguous run × capacity).
 func (n *Notifier) chargeAlert(now time.Time, sched *optimizer.Schedule, soc float64) *Alert {
 	slotDur := time.Duration(n.slotHours * float64(time.Hour))
+	start := -1
 	for i := range sched.Slots {
 		s := &sched.Slots[i]
 		if s.GridCharge && s.Start.Add(slotDur).After(now) {
-			a := n.alert("EnergyOptimiserGridCharge", "warning", fmt.Sprintf(
-				"⚡ Grid-charge scheduled for %s (battery now %.0f%%).",
-				s.Start.In(n.loc).Format("15:04 Mon"), soc*100), now)
-			return &a
+			start = i
+			break
 		}
 	}
-	return nil
+	if start < 0 {
+		return nil
+	}
+	// Extend across the contiguous grid-charge run (this imminent episode only).
+	end := start
+	for end < len(sched.Slots) && sched.Slots[end].GridCharge {
+		end++
+	}
+	socBefore := soc
+	if start > 0 {
+		socBefore = sched.Slots[start-1].SOC
+	}
+	socEnd := sched.Slots[end-1].SOC
+	addedKWh := (socEnd - socBefore) * n.capacity
+
+	a := n.alert("EnergyOptimiserGridCharge", "warning", fmt.Sprintf(
+		"⚡ Grid-charge scheduled for %s — plans to add ~%.1f kWh to the battery (%.0f%% → %.0f%%).",
+		sched.Slots[start].Start.In(n.loc).Format("15:04 Mon"), addedKWh, socBefore*100, socEnd*100), now)
+	return &a
 }
 
 // lowSOCAlert fires when the projected SoC trough over the next 24h is at/below

@@ -50,6 +50,7 @@ func testNotifier(amURL string) *Notifier {
 		rates:     config.Rates{Currency: "¥"},
 		site:      "home",
 		currency:  "¥",
+		capacity:  49.8,
 		slotHours: 0.5,
 		resolveIn: 15 * time.Minute,
 		riskSOC:   0.15,
@@ -78,7 +79,7 @@ func TestAlertManagerDisabledIsNoop(t *testing.T) {
 
 // TestChargeAlertStableIdentity is the core regression: the alert identity (its
 // label set) must NOT depend on live SoC, so Alertmanager dedupes it instead of
-// re-firing every 1% tick. SoC lives only in the annotation.
+// re-firing every 1% tick. The summary reports energy added over the charge run.
 func TestChargeAlertStableIdentity(t *testing.T) {
 	srv, got := captureAM(t)
 	defer srv.Close()
@@ -86,28 +87,32 @@ func TestChargeAlertStableIdentity(t *testing.T) {
 
 	now := time.Date(2026, 7, 21, 7, 0, 0, 0, time.UTC)
 	sched := &optimizer.Schedule{Slots: []optimizer.Slot{
-		{Start: now.Add(1 * time.Hour), SOC: 0.8},
-		{Start: now.Add(2 * time.Hour), SOC: 0.8, GridCharge: true},
+		{Start: now.Add(1 * time.Hour), SOC: 0.30},                       // "before" the run
+		{Start: now.Add(2 * time.Hour), SOC: 0.50, GridCharge: true},     // run start
+		{Start: now.Add(150 * time.Minute), SOC: 0.60, GridCharge: true}, // run end
 	}}
 
-	n.Evaluate(context.Background(), now, sched, 0.30)
-	n.Evaluate(context.Background(), now, sched, 0.55)
+	n.Evaluate(context.Background(), now, sched, 0.28)
+	n.Evaluate(context.Background(), now, sched, 0.55) // live SoC differs; plan identical
 
 	alerts := got()
 	if len(alerts) != 2 {
 		t.Fatalf("expected 2 posts, got %d", len(alerts))
 	}
-	a0, a1 := find([]gotAlert{alerts[0]}, "EnergyOptimiserGridCharge"), find([]gotAlert{alerts[1]}, "EnergyOptimiserGridCharge")
-	if a0 == nil || a1 == nil {
+	a0, a1 := &alerts[0], &alerts[1]
+	if a0.Labels["alertname"] != "EnergyOptimiserGridCharge" || a1.Labels["alertname"] != "EnergyOptimiserGridCharge" {
 		t.Fatalf("both posts must carry the grid-charge alert: %+v", alerts)
 	}
-	// Identical labels (so AM dedupes) despite different SoC.
-	if a0.Labels["alertname"] != a1.Labels["alertname"] || a0.Labels["site"] != "home" || a0.Labels["severity"] != "warning" {
-		t.Fatalf("label identity must be stable + routable: %+v vs %+v", a0.Labels, a1.Labels)
+	// Identical labels (so AM dedupes) + identical summary despite different live SoC.
+	if a0.Labels["site"] != "home" || a0.Labels["severity"] != "warning" {
+		t.Fatalf("labels must be routable: %+v", a0.Labels)
 	}
-	// SoC differs only in the annotation.
-	if !strings.Contains(a0.Annotations["summary"], "30%") || !strings.Contains(a1.Annotations["summary"], "55%") {
-		t.Fatalf("SoC should vary in annotation: %q / %q", a0.Annotations["summary"], a1.Annotations["summary"])
+	if a0.Annotations["summary"] != a1.Annotations["summary"] {
+		t.Fatalf("summary must not depend on live SoC: %q vs %q", a0.Annotations["summary"], a1.Annotations["summary"])
+	}
+	// Energy added over the run: (0.60 - 0.30) * 49.8 ≈ 14.9 kWh, and the SoC span.
+	if !strings.Contains(a0.Annotations["summary"], "kWh") || !strings.Contains(a0.Annotations["summary"], "30% → 60%") {
+		t.Fatalf("summary should report energy + SoC span: %q", a0.Annotations["summary"])
 	}
 }
 
