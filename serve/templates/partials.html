@@ -7,7 +7,7 @@
     <div class="k">Last tick</div>
     <div class="v">{{.LastTick}}</div>
 </div>
-<div class="live"><span class="dot"></span>Live</div>
+<div class="live{{if .Stale}} stale{{end}}"><span class="dot"></span>{{if .Stale}}Stale — feed frozen{{else}}Live{{end}}</div>
 {{end}}
 
 

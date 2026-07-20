@@ -18,6 +18,7 @@ type DashboardView struct {
 	ModelNote    string // one-line confidence caption
 	LastTick     string // wall-clock of the last completed tick
 	HasData      bool
+	Stale        bool // live HA feed is frozen/disconnected — numbers are not current
 
 	Decision       Decision
 	Tiles          []Tile
@@ -153,6 +154,7 @@ func (s *Server) buildView() *DashboardView {
 	} else {
 		v.LastTick = "--:--:--"
 	}
+	v.Stale = s.provider.DataStale()
 
 	v.Tiles = buildTiles(st, socFrac, powerKW, pvKW, gridKW, loadKW)
 	v.ChargeGauge, v.DischargeGauge = s.buildGauges(socFrac, powerKW)

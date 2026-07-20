@@ -34,6 +34,7 @@ type StateProvider interface {
 	CurrentState() map[string]float64
 	LoadConfidence() float64
 	LastTick() time.Time
+	DataStale() bool
 	Subscribe() *Subscriber
 	Unsubscribe(sub *Subscriber)
 }

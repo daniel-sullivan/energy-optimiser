@@ -425,6 +425,18 @@ func (h *Hub) CurrentState() map[string]float64 {
 	}
 }
 
+// DataStale reports whether the live HA feed has frozen — the websocket is down
+// or no entity has refreshed recently (the freshest entities update every few
+// seconds, so >2 min means a dead feed). Surfaced in the dashboard so stale
+// numbers cannot masquerade as live.
+func (h *Hub) DataStale() bool {
+	if !h.ha.Connected() {
+		return true
+	}
+	nu := h.ha.NewestUpdate()
+	return nu.IsZero() || time.Since(nu) > 2*time.Minute
+}
+
 // --- loadmodel.DataSource adapter ---
 
 type loadDataSource struct {
