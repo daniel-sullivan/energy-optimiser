@@ -224,24 +224,27 @@ func (h *Hub) tick(ctx context.Context) {
 	h.broadcast()
 }
 
-// notifyRecommendation sends an HA notification when the observe-mode
-// recommendation changes (e.g. the next grid-charge window it would schedule),
-// so the plan is visible and reviewable before live actuation is enabled.
+// notifyRecommendation sends an HA notification when the optimizer newly
+// recommends a grid-charge window (observe mode), so the plan is visible and
+// reviewable before live actuation is enabled. Only positive recommendations
+// notify — "nothing to do" stays silent.
 func (h *Hub) notifyRecommendation(ctx context.Context, now time.Time, sched *optimizer.Schedule, soc float64) {
-	var msg string
+	var chargeSlot *optimizer.Slot
 	for i := range sched.Slots {
 		s := &sched.Slots[i]
 		if !s.Start.Before(now) && s.GridCharge {
-			msg = fmt.Sprintf("I'd recommend grid-charging at %s (battery now %.0f%%).",
-				s.Start.In(h.cfg.Location()).Format("15:04 Mon"), soc*100)
+			chargeSlot = s
 			break
 		}
 	}
-	if msg == "" {
-		msg = "No grid charge recommended — solar covers the horizon."
+	if chargeSlot == nil {
+		h.lastRec = "" // nothing to recommend; a future charge notifies as new
+		return
 	}
+	msg := fmt.Sprintf("I'd recommend grid-charging at %s (battery now %.0f%%).",
+		chargeSlot.Start.In(h.cfg.Location()).Format("15:04 Mon"), soc*100)
 	if msg == h.lastRec {
-		return // only notify when the recommendation changes
+		return // already notified this recommendation
 	}
 	h.lastRec = msg
 	if err := h.ha.CallService(ctx, "persistent_notification", "create", map[string]any{
