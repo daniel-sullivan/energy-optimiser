@@ -21,6 +21,7 @@ map:
   - config:rw
 options:
   time_zone: "UTC"
+  observe: true
   service:
     poll_interval: 300
     planning_horizon: 259200
@@ -76,6 +77,7 @@ options:
     password: ""
 schema:
   time_zone: str
+  observe: bool?
   service:
     poll_interval: "int(10,3600)"
     planning_horizon: "int(3600,604800)"

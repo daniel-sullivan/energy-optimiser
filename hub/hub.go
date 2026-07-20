@@ -29,10 +29,12 @@ type Hub struct {
 	decisionPub *serve.DecisionPublisher
 	server      *serve.Server
 	dryRun      bool
+	observe     bool
 
 	mu          sync.RWMutex
 	schedule    *optimizer.Schedule
 	lastTick    time.Time
+	lastRec     string
 	subscribers map[*serve.Subscriber]struct{}
 }
 
@@ -44,6 +46,7 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		loadModel:   loadmodel.New(cfg.Circuits, cfg.HomeAssistant.Entities.LoadPower),
 		ha:          ha.New(cfg.HomeAssistant),
 		dryRun:      dryRun,
+		observe:     cfg.Observe,
 		subscribers: make(map[*serve.Subscriber]struct{}),
 	}
 
@@ -192,7 +195,10 @@ func (h *Hub) tick(ctx context.Context) {
 
 	slot := sched.CurrentSlot(now)
 	if slot != nil {
-		if err := h.actuator.SetGridCharge(slot.GridCharge); err != nil {
+		if h.observe {
+			slog.Info("observe mode — not actuating", "would_grid_charge", slot.GridCharge)
+			h.notifyRecommendation(ctx, now, sched, currentSOC)
+		} else if err := h.actuator.SetGridCharge(slot.GridCharge); err != nil {
 			slog.Error("set grid charge", "error", err)
 		}
 	}
@@ -216,6 +222,35 @@ func (h *Hub) tick(ctx context.Context) {
 	h.lastTick = time.Now()
 	h.mu.Unlock()
 	h.broadcast()
+}
+
+// notifyRecommendation sends an HA notification when the observe-mode
+// recommendation changes (e.g. the next grid-charge window it would schedule),
+// so the plan is visible and reviewable before live actuation is enabled.
+func (h *Hub) notifyRecommendation(ctx context.Context, now time.Time, sched *optimizer.Schedule, soc float64) {
+	var msg string
+	for i := range sched.Slots {
+		s := &sched.Slots[i]
+		if !s.Start.Before(now) && s.GridCharge {
+			msg = fmt.Sprintf("I'd recommend grid-charging at %s (battery now %.0f%%).",
+				s.Start.In(h.cfg.Location()).Format("15:04 Mon"), soc*100)
+			break
+		}
+	}
+	if msg == "" {
+		msg = "No grid charge recommended — solar covers the horizon."
+	}
+	if msg == h.lastRec {
+		return // only notify when the recommendation changes
+	}
+	h.lastRec = msg
+	if err := h.ha.CallService(ctx, "persistent_notification", "create", map[string]any{
+		"title":           "Energy Optimiser",
+		"message":         msg,
+		"notification_id": "energy_optimiser_recommendation",
+	}); err != nil {
+		slog.Warn("recommendation notify failed", "error", err)
+	}
 }
 
 func (h *Hub) maybeRefreshSolar(ctx context.Context, now time.Time) {

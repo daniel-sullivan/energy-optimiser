@@ -1,6 +1,11 @@
 # Time zone for all tariff-window / scheduling math (defaults to Asia/Tokyo).
 time_zone = "Asia/Tokyo"
 
+# observe = true: run the optimizer, publish the dashboard + HA decision/
+# time-remaining entities + recommendation notifications, but DO NOT actuate the
+# inverter. Set false only once you're ready for live grid-charge control.
+observe = false
+
 [service]
 poll_interval = "5m"
 planning_horizon = "72h"

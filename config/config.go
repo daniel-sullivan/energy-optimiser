@@ -25,6 +25,11 @@ type Config struct {
 	// TimeZone pins all tariff-window / scheduling math. Defaults to Asia/Tokyo.
 	TimeZone string `toml:"time_zone"`
 
+	// Observe runs the optimizer and publishes the dashboard + HA decision/
+	// time-remaining entities WITHOUT actuating the inverter — a supervised
+	// rollout step before enabling live grid-charge control.
+	Observe bool `toml:"observe"`
+
 	loc *time.Location
 }
 
