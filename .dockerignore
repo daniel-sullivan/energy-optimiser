@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.claude
+docs
+README.md
+CLAUDE.md
+DESIGN.md
+LICENSE
+config.local.toml
+.env.local
+.deps
+energy-optimiser

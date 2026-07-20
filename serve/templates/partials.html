@@ -1,0 +1,148 @@
+{{define "meta"}}
+<div class="m">
+    <div class="k">Load model</div>
+    <div class="v" style="color:{{if .ConfidenceHi}}var(--ok){{else}}var(--dim){{end}}">{{.Confidence}}%</div>
+</div>
+<div class="m">
+    <div class="k">Last tick</div>
+    <div class="v">{{.LastTick}}</div>
+</div>
+<div class="live"><span class="dot"></span>Live</div>
+{{end}}
+
+
+{{define "decision"}}
+<div class="dbar" style="background:var(--{{.Decision.Accent}})"></div>
+<div class="row" style="--acc:var(--{{.Decision.Accent}})">
+    <div>
+        <div class="doing">Optimiser is</div>
+        <div class="verb">{{.Decision.Action}}</div>
+    </div>
+    <div class="why">{{.Decision.Rationale}}</div>
+    {{if .Decision.NextLabel}}<div class="next"><span class="glyph"></span>{{.Decision.NextLabel}}</div>{{end}}
+</div>
+{{end}}
+
+
+{{define "tiles"}}
+{{range .Tiles}}
+<div class="tile {{.Accent}}" data-key="{{.Key}}">
+    <div class="lab">{{.Label}}</div>
+    <div class="val">{{.Value}}<span class="u">{{.Unit}}</span></div>
+    <div class="sub">{{.Sub}}</div>
+</div>
+{{end}}
+{{end}}
+
+
+{{define "gauge"}}
+<div class="gauge {{.Accent}} {{if .Active}}active{{else}}dim{{end}}">
+    <svg class="ring" viewBox="0 0 128 128" role="img" aria-label="{{.Title}} {{.Big}}">
+        <circle class="track" cx="64" cy="64" r="54"></circle>
+        <circle class="fill" cx="64" cy="64" r="54"
+                stroke-dasharray="{{printf "%.1f" .Dash}} {{printf "%.1f" .Circ}}"
+                transform="rotate(-90 64 64)"></circle>
+        <text class="center" x="64" y="62" text-anchor="middle">{{printf "%.0f" (mulf .Frac 100)}}%</text>
+        <text class="center small" x="64" y="78" text-anchor="middle">usable</text>
+    </svg>
+    <div class="txt">
+        <div class="g-title">{{.Title}}</div>
+        <div class="g-big">{{.Big}}</div>
+        <div class="g-sub">{{.Sub}}</div>
+        <div class="badge">{{if .Active}}active{{else}}idle{{end}}</div>
+    </div>
+</div>
+{{end}}
+
+{{define "gauges"}}
+{{template "gauge" .ChargeGauge}}
+{{template "gauge" .DischargeGauge}}
+{{end}}
+
+
+{{define "ribbon"}}
+{{with .Ribbon}}
+{{if .Empty}}
+<p class="empty">Waiting for the first schedule — the optimiser solves on the next tick.</p>
+{{else}}
+<div class="ribbon-wrap">
+    <div class="ribbon">
+        <svg class="plot" viewBox="0 0 {{printf "%.0f" .W}} {{printf "%.0f" .H}}" preserveAspectRatio="none">
+            <defs>
+                <linearGradient id="socgrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="#3ec6ff" stop-opacity=".34"></stop>
+                    <stop offset="1" stop-color="#3ec6ff" stop-opacity=".02"></stop>
+                </linearGradient>
+            </defs>
+            {{range .OffPeak}}<rect class="rb-offpeak" x="{{printf "%.2f" .X}}" y="0" width="{{printf "%.2f" .W}}" height="100"></rect>{{end}}
+            <line class="rb-guide" x1="0" y1="{{printf "%.2f" .BandTopY}}" x2="{{printf "%.0f" .W}}" y2="{{printf "%.2f" .BandTopY}}"></line>
+            <line class="rb-guide" x1="0" y1="{{printf "%.2f" .BandBotY}}" x2="{{printf "%.0f" .W}}" y2="{{printf "%.2f" .BandBotY}}"></line>
+            <path class="rb-area" d="{{.SocArea}}"></path>
+            <path class="rb-line" d="{{.SocLine}}"></path>
+            {{range .Bands}}<rect class="rb-band {{.Kind}}" x="{{printf "%.2f" .X}}" y="95.5" width="{{printf "%.2f" .W}}" height="4.5"></rect>{{end}}
+            {{if .NowShown}}<line class="rb-now" x1="{{printf "%.3f" (mulf .NowFrac .W)}}" y1="0" x2="{{printf "%.3f" (mulf .NowFrac .W)}}" y2="100"></line>{{end}}
+        </svg>
+        <div class="rb-yaxis" style="top:calc({{printf "%.2f" .BandTopY}}% - 6px)">{{.MaxLabel}}</div>
+        <div class="rb-yaxis" style="top:calc({{printf "%.2f" .BandBotY}}% - 6px)">{{.MinLabel}}</div>
+        <div class="rb-cols">
+            {{range .Cols}}
+            <div class="rb-col" style="left:calc({{printf "%.4f" .Frac}} * 100%); width:calc({{printf "%.4f" .W}} * 100%)">
+                <div class="tip">
+                    <b>{{.When}}</b><br>
+                    SoC {{.SOC}} &middot; <span class="{{if eq .Kind "charge"}}kc{{else if eq .Kind "discharge"}}kd{{else}}ks{{end}}">{{.Kind}}</span><br>
+                    batt {{.Batt}} &middot; load {{.Load}}<br>
+                    solar {{.Solar}} &middot; import {{.Grid}}
+                </div>
+            </div>
+            {{end}}
+        </div>
+    </div>
+    <div class="rb-axis" style="min-width:640px">
+        {{range .Marks}}
+        <div class="rb-tick {{if .IsDay}}day{{end}}" style="left:calc({{printf "%.4f" .Frac}} * 100%)"></div>
+        <div class="rb-tlabel {{if .IsDay}}day{{end}}" style="left:calc({{printf "%.4f" .Frac}} * 100%)">{{.Label}}</div>
+        {{end}}
+    </div>
+</div>
+<div class="legend">
+    <span><i style="background:var(--charge)"></i>Grid charge</span>
+    <span><i style="background:var(--discharge)"></i>Discharge</span>
+    <span><i style="background:var(--charge-dim)"></i>Off-peak window (cheap tariff)</span>
+    <span><i style="background:var(--ink)"></i>State of charge</span>
+    <span><i style="background:var(--solar)"></i>Now</span>
+</div>
+{{end}}
+{{end}}
+{{end}}
+
+
+{{define "forecast"}}
+{{with .Forecast}}
+{{if .Line}}
+<svg viewBox="0 0 {{printf "%.0f" .W}} {{printf "%.0f" .H}}" preserveAspectRatio="none" role="img" aria-label="Solar forecast">
+    <path class="fc-area" d="{{.Area}}"></path>
+    <path class="fc-line" d="{{.Line}}"></path>
+</svg>
+<div class="fc-stats">
+    <div><div class="k">Peak</div><div class="v">{{.Peak}}</div></div>
+    <div><div class="k">When</div><div class="v ink">{{.PeakWhen}}</div></div>
+    <div><div class="k">Total</div><div class="v ink">{{.TotalKWh}}</div></div>
+</div>
+{{else}}
+<p class="empty">{{.Peak}}</p>
+{{end}}
+{{end}}
+{{end}}
+
+
+{{define "events"}}
+{{if .Events}}
+<ul class="events">
+    {{range .Events}}
+    <li><span class="t">{{.Time}}</span><span class="k {{.Kind}}"></span><span class="d">{{.Desc}}</span></li>
+    {{end}}
+</ul>
+{{else}}
+<p class="empty">No state changes planned in the horizon — steady on the current mode.</p>
+{{end}}
+{{end}}

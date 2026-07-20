@@ -1,0 +1,132 @@
+name: Energy Optimiser
+description: Forecast-driven off-peak battery charge optimiser for solar + battery systems
+slug: energy-optimiser
+version: 0.1.0
+url: https://github.com/daniel-sullivan/energy-optimiser
+arch:
+  - amd64
+  - aarch64
+  - armv7
+homeassistant_api: false
+init: false
+startup: services
+timeout: 60
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:battery-charging-high
+panel_title: Energy
+services:
+  - mqtt:want
+map:
+  - config:rw
+options:
+  time_zone: "UTC"
+  service:
+    poll_interval: 300
+    planning_horizon: 259200
+    slot_duration: 1800
+  homeassistant:
+    url: "ws://homeassistant.local:8123/api/websocket"
+    token: ""
+  entities:
+    battery_soc: "sensor.battery_soc"
+    battery_power: "sensor.battery_power"
+    pv_power: "sensor.pv_power"
+    grid_power: "sensor.grid_power"
+    load_power: "sensor.load_power"
+  influxdb:
+    url: "http://localhost:8428"
+    token: ""
+    database: "homeassistant"
+  solcast:
+    api_key: ""
+    sites:
+      - name: "house"
+        id: ""
+  weather:
+    latitude: -33.87
+    longitude: 151.21
+  battery:
+    capacity_kwh: 10.0
+    max_charge_kw: 5.0
+    max_discharge_kw: 5.0
+    soc_min: 0.2
+    soc_max: 1.0
+    efficiency: 0.95
+    nominal_voltage_v: 51.2
+  rates:
+    currency: "USD"
+    peak_rate: 0.35
+    off_peak_rate: 0.12
+    feed_in_rate: 0.05
+    off_peak_windows:
+      - start: "01:00"
+        end: "05:00"
+        rate: 0.0
+  optimizer:
+    soc_risk_weight: 2.0
+    confidence_threshold: 0.3
+    min_charge_kw: 1.0
+    blip_cost: 5.0
+  mqtt:
+    broker: ""
+    topic_prefix: "homeassistant"
+    device_id: "srne_system"
+    username: ""
+    password: ""
+schema:
+  time_zone: str
+  service:
+    poll_interval: "int(10,3600)"
+    planning_horizon: "int(3600,604800)"
+    slot_duration: "int(60,3600)"
+  homeassistant:
+    url: url
+    token: password
+  entities:
+    battery_soc: str
+    battery_power: str?
+    pv_power: str
+    grid_power: str
+    load_power: str
+  influxdb:
+    url: url
+    token: password?
+    database: str
+  solcast:
+    api_key: password
+    sites:
+      - name: str
+        id: str
+  weather:
+    latitude: float
+    longitude: float
+  battery:
+    capacity_kwh: float
+    max_charge_kw: float
+    max_discharge_kw: float
+    soc_min: "float(0,1)"
+    soc_max: "float(0,1)"
+    efficiency: "float(0,1)"
+    nominal_voltage_v: float?
+  rates:
+    currency: str
+    peak_rate: float
+    off_peak_rate: float
+    feed_in_rate: float
+    off_peak_windows:
+      - start: str
+        end: str
+        rate: float?
+  optimizer:
+    soc_risk_weight: float
+    confidence_threshold: "float(0,1)"
+    min_charge_kw: float
+    blip_cost: float
+  mqtt:
+    broker: url?
+    topic_prefix: str?
+    device_id: str?
+    username: str?
+    password: password?
+image: ghcr.io/daniel-sullivan/energy-optimiser/{arch}

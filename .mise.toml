@@ -1,0 +1,22 @@
+[tools]
+go = "1.26"
+
+[env]
+# Secrets (HA_TOKEN, …) live here, gitignored. Run the binary under `mise` so they load.
+_.file = ".env.local"
+
+[tasks.build]
+description = "Build all packages"
+run = "go build ./..."
+
+[tasks.test]
+description = "Run tests with race detector and coverage"
+run = "go test -race -cover ./..."
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run"
+
+[tasks.check]
+description = "Build + test + lint"
+depends = ["build", "test", "lint"]

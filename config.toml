@@ -1,0 +1,107 @@
+# Time zone for all tariff-window / scheduling math (defaults to Asia/Tokyo).
+time_zone = "Asia/Tokyo"
+
+[service]
+poll_interval = "5m"
+planning_horizon = "72h"
+slot_duration = "30m"
+web_port = 8080
+
+[influxdb]
+url = "http://localhost:8181"
+token = "your-influxdb-token"
+database = "energy"
+
+# HA default InfluxDB uses unit_of_measurement as table name.
+# Adjust these if your sensors use different units (e.g., "kW" instead of "W").
+[influxdb.measurements]
+power = "W"
+temperature = "°C"
+percentage = "%"
+
+[homeassistant]
+url = "ws://homeassistant.local:8123/api/websocket"
+token = "your-ha-long-lived-access-token"
+
+[homeassistant.entities]
+battery_soc = "sensor.battery_soc"
+pv_power = "sensor.pv_power"
+grid_power = "sensor.grid_power"
+load_power = "sensor.load_power"
+
+[solcast]
+api_key = "your-solcast-api-key"
+poll_times = ["06:00", "12:00"]
+
+# One or more rooftop sites; per-site forecasts are summed.
+[[solcast.sites]]
+name = "house"
+id = "your-site-id"
+
+[weather]
+latitude = -33.87
+longitude = 151.21
+
+[battery]
+capacity_kwh = 9.6        # size to your battery bank
+max_charge_kw = 5.0
+max_discharge_kw = 5.0
+soc_min = 0.20
+soc_max = 1.0
+efficiency = 0.95          # round-trip
+
+[rates]
+currency = "AUD"
+peak_rate = 0.35
+off_peak_rate = 0.12
+feed_in_rate = 0.05
+
+[[rates.off_peak_windows]]
+start = "01:00"
+end = "05:00"
+
+[[rates.off_peak_windows]]
+start = "11:00"
+end = "13:00"
+
+[optimizer]
+soc_risk_weight = 2.0
+confidence_threshold = 0.3  # below this, use conservative defaults
+min_charge_kw = 1.0         # a grid-charge permit must yield >= this (no empty-bypass)
+blip_cost = 5.0             # currency penalty per bypass entry (skips marginal windows)
+
+[mqtt]
+broker = "tcp://localhost:1883"
+topic_prefix = "homeassistant"
+device_id = "srne_system"                 # actuation target: your inverter's MQTT controller device
+# decision_device_id = "energy_optimiser" # this app's own HA-discovery device for the plan + time-remaining (default: energy_optimiser)
+# username = ""                           # MQTT broker auth (blank = anonymous); supports env:VARNAME
+# password = ""
+
+# CT-monitored circuits for load modeling.
+# Category: fixed (always-on), routine (time-dependent), weather (temp-dependent), deferrable (optimizer-controlled)
+
+[[circuit]]
+name = "kitchen"
+entity_id = "sensor.ct_kitchen_power"
+category = "routine"
+
+[[circuit]]
+name = "lighting"
+entity_id = "sensor.ct_lighting_power"
+category = "fixed"
+
+[[circuit]]
+name = "ac"
+entity_id = "sensor.ct_ac_power"
+category = "weather"
+
+# v2+ deferrable loads
+# [[load]]
+# name = "water_heater"
+# entity = "switch.water_heater"
+# priority = 1
+# energy_kwh = 3.0
+# deadline = "15:00"
+# min_run_minutes = 30
+# avoid_windows = ["17:00-18:00"]

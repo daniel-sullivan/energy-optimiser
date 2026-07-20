@@ -1,0 +1,161 @@
+configuration:
+  time_zone:
+    name: Time Zone
+    description: >-
+      IANA time zone (e.g. Australia/Sydney) used for all tariff-window and
+      scheduling math.
+  service:
+    name: Service
+    description: Core scheduling parameters.
+  service.poll_interval:
+    name: Poll Interval
+    description: How often to re-run the optimiser, in seconds.
+  service.planning_horizon:
+    name: Planning Horizon
+    description: How far ahead to plan, in seconds (e.g. 259200 = 72h).
+  service.slot_duration:
+    name: Slot Duration
+    description: Length of each planning slot, in seconds (e.g. 1800 = 30m).
+  homeassistant:
+    name: Home Assistant
+    description: Connection details for the Home Assistant instance to read sensors from.
+  homeassistant.url:
+    name: URL
+    description: >-
+      Home Assistant WebSocket API URL (e.g. ws://homeassistant.local:8123/api/websocket).
+  homeassistant.token:
+    name: Long-Lived Access Token
+    description: A Home Assistant long-lived access token with read access to the entities below.
+  entities:
+    name: Entities
+    description: Home Assistant entity IDs the optimiser reads live state from.
+  entities.battery_soc:
+    name: Battery SOC Entity
+    description: Sensor entity reporting battery state of charge (%).
+  entities.battery_power:
+    name: Battery Power Entity
+    description: >-
+      Optional sensor entity reporting signed battery power (positive = charging,
+      negative = discharging).
+  entities.pv_power:
+    name: PV Power Entity
+    description: Sensor entity reporting total solar (PV) power.
+  entities.grid_power:
+    name: Grid Power Entity
+    description: Sensor entity reporting grid import/export power.
+  entities.load_power:
+    name: Load Power Entity
+    description: Sensor entity reporting total house load power.
+  influxdb:
+    name: History Datastore
+    description: >-
+      InfluxDB (or InfluxDB-compatible, e.g. VictoriaMetrics) instance the
+      optimiser reads historical data from.
+  influxdb.url:
+    name: URL
+    description: Base URL of the history datastore.
+  influxdb.token:
+    name: Token
+    description: Optional auth token for the history datastore.
+  influxdb.database:
+    name: Database
+    description: Database / bucket name to query.
+  solcast:
+    name: Solcast Forecast
+    description: Solcast solar-forecast API credentials and rooftop sites.
+  solcast.api_key:
+    name: API Key
+    description: Solcast API key.
+  solcast.sites:
+    name: Sites
+    description: One or more rooftop sites; per-site forecasts are summed.
+  weather:
+    name: Weather
+    description: Coordinates used for weather-driven load modelling.
+  weather.latitude:
+    name: Latitude
+    description: Site latitude, in decimal degrees.
+  weather.longitude:
+    name: Longitude
+    description: Site longitude, in decimal degrees.
+  battery:
+    name: Battery
+    description: Physical battery model parameters.
+  battery.capacity_kwh:
+    name: Capacity (kWh)
+    description: Usable battery capacity in kWh.
+  battery.max_charge_kw:
+    name: Max Charge (kW)
+    description: Maximum battery charge power in kW.
+  battery.max_discharge_kw:
+    name: Max Discharge (kW)
+    description: Maximum battery discharge power in kW.
+  battery.soc_min:
+    name: Min SOC
+    description: Minimum allowed state of charge (0.0-1.0).
+  battery.soc_max:
+    name: Max SOC
+    description: Maximum allowed state of charge (0.0-1.0).
+  battery.efficiency:
+    name: Round-Trip Efficiency
+    description: Battery round-trip efficiency (0.0-1.0).
+  battery.nominal_voltage_v:
+    name: Nominal Voltage (V)
+    description: Optional nominal pack voltage, used for kW-to-amps actuation.
+  rates:
+    name: Electricity Rates
+    description: Tariff structure used to price the optimisation.
+  rates.currency:
+    name: Currency
+    description: Currency code for the rates below (e.g. USD, AUD, JPY).
+  rates.peak_rate:
+    name: Peak Rate
+    description: Import price per kWh outside off-peak windows.
+  rates.off_peak_rate:
+    name: Off-Peak Rate
+    description: Fallback import price per kWh for off-peak windows without an explicit rate.
+  rates.feed_in_rate:
+    name: Feed-In Rate
+    description: >-
+      Export (feed-in) price per kWh. Must be lower than the cheapest
+      off-peak rate.
+  rates.off_peak_windows:
+    name: Off-Peak Windows
+    description: >-
+      Time-of-day windows with cheaper import pricing. Each window may set
+      its own rate, otherwise it falls back to the Off-Peak Rate above.
+  optimizer:
+    name: Optimizer
+    description: Tuning knobs for the scheduling optimiser.
+  optimizer.soc_risk_weight:
+    name: SOC Risk Weight
+    description: Objective penalty weight for running the battery low.
+  optimizer.confidence_threshold:
+    name: Confidence Threshold
+    description: Below this forecast confidence, fall back to conservative defaults.
+  optimizer.min_charge_kw:
+    name: Min Charge (kW)
+    description: A grid-charge permit must yield at least this much charge.
+  optimizer.blip_cost:
+    name: Blip Cost
+    description: Objective penalty (in currency) per bypass/mode-switch entry.
+  mqtt:
+    name: MQTT
+    description: >-
+      Broker used to publish battery-actuation commands. Leave broker empty
+      to auto-discover the Mosquitto add-on.
+  mqtt.broker:
+    name: Broker
+    description: Override broker URL (e.g. tcp://192.168.1.100:1883). Leave empty to auto-discover.
+  mqtt.topic_prefix:
+    name: Topic Prefix
+    description: Base topic for MQTT discovery (default homeassistant).
+  mqtt.device_id:
+    name: Actuator Device ID
+    description: MQTT device of your inverter's controller (e.g. srne_system) that receives actuation commands — not the optimiser's own publish device.
+  mqtt.username:
+    name: Username
+    description: MQTT broker username (leave empty for anonymous or auto-discovery from the Mosquitto add-on).
+  mqtt.password:
+    name: Password
+    description: MQTT broker password.
