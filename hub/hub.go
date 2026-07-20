@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"energy-optimiser/actuator"
+	"energy-optimiser/alert"
 	"energy-optimiser/config"
 	"energy-optimiser/forecast"
 	"energy-optimiser/ha"
@@ -26,6 +27,7 @@ type Hub struct {
 	loadModel   *loadmodel.Model
 	ha          *ha.Client
 	actuator    *actuator.Actuator
+	notifier    *alert.Notifier
 	decisionPub *serve.DecisionPublisher
 	server      *serve.Server
 	dryRun      bool
@@ -34,7 +36,6 @@ type Hub struct {
 	mu          sync.RWMutex
 	schedule    *optimizer.Schedule
 	lastTick    time.Time
-	lastRec     string
 	subscribers map[*serve.Subscriber]struct{}
 }
 
@@ -49,6 +50,7 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		observe:     cfg.Observe,
 		subscribers: make(map[*serve.Subscriber]struct{}),
 	}
+	h.notifier = alert.NewNotifier(cfg)
 
 	// InfluxDB — non-fatal in dry-run, load model falls back to defaults
 	db, err := influx.New(cfg.InfluxDB)
@@ -197,7 +199,7 @@ func (h *Hub) tick(ctx context.Context) {
 	if slot != nil {
 		if h.observe {
 			slog.Info("observe mode — not actuating", "would_grid_charge", slot.GridCharge)
-			h.notifyRecommendation(ctx, now, sched, currentSOC)
+			h.notifier.Evaluate(ctx, now, sched, currentSOC)
 		} else if err := h.actuator.SetGridCharge(slot.GridCharge); err != nil {
 			slog.Error("set grid charge", "error", err)
 		}
@@ -222,38 +224,6 @@ func (h *Hub) tick(ctx context.Context) {
 	h.lastTick = time.Now()
 	h.mu.Unlock()
 	h.broadcast()
-}
-
-// notifyRecommendation sends an HA notification when the optimizer newly
-// recommends a grid-charge window (observe mode), so the plan is visible and
-// reviewable before live actuation is enabled. Only positive recommendations
-// notify — "nothing to do" stays silent.
-func (h *Hub) notifyRecommendation(ctx context.Context, now time.Time, sched *optimizer.Schedule, soc float64) {
-	var chargeSlot *optimizer.Slot
-	for i := range sched.Slots {
-		s := &sched.Slots[i]
-		if !s.Start.Before(now) && s.GridCharge {
-			chargeSlot = s
-			break
-		}
-	}
-	if chargeSlot == nil {
-		h.lastRec = "" // nothing to recommend; a future charge notifies as new
-		return
-	}
-	msg := fmt.Sprintf("I'd recommend grid-charging at %s (battery now %.0f%%).",
-		chargeSlot.Start.In(h.cfg.Location()).Format("15:04 Mon"), soc*100)
-	if msg == h.lastRec {
-		return // already notified this recommendation
-	}
-	h.lastRec = msg
-	if err := h.ha.CallService(ctx, "persistent_notification", "create", map[string]any{
-		"title":           "Energy Optimiser",
-		"message":         msg,
-		"notification_id": "energy_optimiser_recommendation",
-	}); err != nil {
-		slog.Warn("recommendation notify failed", "error", err)
-	}
 }
 
 func (h *Hub) maybeRefreshSolar(ctx context.Context, now time.Time) {

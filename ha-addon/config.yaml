@@ -1,7 +1,7 @@
 name: Energy Optimiser
 description: Forecast-driven off-peak battery charge optimiser for solar + battery systems
 slug: energy-optimiser
-version: 0.1.3
+version: 0.1.4
 url: https://github.com/daniel-sullivan/energy-optimiser
 arch:
   - amd64
@@ -75,6 +75,12 @@ options:
     device_id: "srne_system"
     username: ""
     password: ""
+  alertmanager:
+    url: ""
+    site: "home"
+  alerts:
+    risk_soc_threshold: 0.15
+    expensive_day_yen: 300
 schema:
   time_zone: str
   observe: bool?
@@ -131,4 +137,10 @@ schema:
     device_id: str?
     username: str?
     password: password?
+  alertmanager:
+    url: str?
+    site: str?
+  alerts:
+    risk_soc_threshold: "float(0,1)"
+    expensive_day_yen: float
 image: ghcr.io/daniel-sullivan/energy-optimiser/{arch}

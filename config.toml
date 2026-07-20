@@ -83,6 +83,14 @@ device_id = "srne_system"                 # actuation target: your inverter's MQ
 # username = ""                           # MQTT broker auth (blank = anonymous); supports env:VARNAME
 # password = ""
 
+[alertmanager]
+# url = "http://alertmanager:9093"        # POST decision/risk alerts to an Alertmanager (blank = disabled); it routes to Discord/etc.
+# site = "home"                            # routing label attached to every alert (default "home")
+
+[alerts]
+risk_soc_threshold = 0.15                  # projected SoC (0-1) at/below this within 24h -> warn (default 0.15)
+expensive_day_yen = 300                    # projected peak-rate import cost above this -> warn (default 300)
+
 # CT-monitored circuits for load modeling.
 # Category: fixed (always-on), routine (time-dependent), weather (temp-dependent), deferrable (optimizer-controlled)
 

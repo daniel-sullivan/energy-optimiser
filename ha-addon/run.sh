@@ -204,6 +204,29 @@ else
     exit 1
 fi
 
+# --- Alertmanager routing + alert thresholds ---
+AM_URL=""
+bashio::config.has_value 'alertmanager.url' && AM_URL=$(bashio::config 'alertmanager.url')
+AM_SITE=$(bashio::config 'alertmanager.site')
+RISK_SOC=$(bashio::config 'alerts.risk_soc_threshold')
+EXPENSIVE_YEN=$(bashio::config 'alerts.expensive_day_yen')
+
+if [ -n "${AM_URL}" ] && [ "${AM_URL}" != "null" ]; then
+    cat >> "${CONFIG}" <<EOF
+
+[alertmanager]
+url = "${AM_URL}"
+site = "${AM_SITE}"
+EOF
+fi
+
+cat >> "${CONFIG}" <<EOF
+
+[alerts]
+risk_soc_threshold = ${RISK_SOC}
+expensive_day_yen = ${EXPENSIVE_YEN}
+EOF
+
 chmod 600 "${CONFIG}"
 
 bashio::log.info "Starting Energy Optimiser..."

@@ -19,6 +19,8 @@ type Config struct {
 	Rates         Rates         `toml:"rates"`
 	Optimizer     Optimizer     `toml:"optimizer"`
 	MQTT          MQTT          `toml:"mqtt"`
+	Alertmanager  Alertmanager  `toml:"alertmanager"`
+	Alerts        Alerts        `toml:"alerts"`
 	Circuits      []Circuit     `toml:"circuit"`
 	Loads         []Load        `toml:"load"`
 
@@ -183,6 +185,21 @@ type MQTT struct {
 	// separate from DeviceID: the actuator targets the SRNE controller's
 	// device, this is energy-optimiser's own device.
 	DecisionDeviceID string `toml:"decision_device_id"`
+}
+
+// Alertmanager configures posting decision/risk alerts to an Alertmanager
+// /api/v2/alerts endpoint, which routes them to Discord (and phone-push on
+// critical) via the existing home alerting pipeline. Empty URL disables posting.
+type Alertmanager struct {
+	URL  string `toml:"url"`  // base URL, e.g. http://alertmanager:9093
+	Site string `toml:"site"` // routing label (camp|home); default "home"
+}
+
+// Alerts tunes the decision/risk notifier thresholds. Zero values fall back to
+// defaults (risk_soc 0.15, expensive_day_yen 300).
+type Alerts struct {
+	RiskSOCThreshold float64 `toml:"risk_soc_threshold"` // projected SoC (0-1) at/below this within 24h warns
+	ExpensiveDayYen  float64 `toml:"expensive_day_yen"`  // projected peak-rate import cost above this warns
 }
 
 // CommandTopic returns the MQTT topic for a command.
