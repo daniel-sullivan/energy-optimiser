@@ -212,12 +212,16 @@ func (h *Hub) Run(ctx context.Context) error {
 		}
 	}()
 
-	// Initial solar forecast (non-fatal)
+	// Initial solar forecast (non-fatal). h.solcast was constructed with any
+	// persisted cache from a prior run already loaded (see forecast.NewSolcast),
+	// so route the startup fetch through maybeRefreshSolar rather than always
+	// fetching: a restart that lands within the poll-time freshness window
+	// reuses that cache and spends zero Solcast API calls — important since the
+	// free tier's daily request cap is easily exhausted by a handful of
+	// restarts. A genuinely stale or missing cache still fetches immediately,
+	// same as before.
 	if cfg := h.cfg.Solcast; cfg.APIKey != "" {
-		h.lastSolcastAttempt = time.Now()
-		if _, err := h.solcast.Fetch(ctx); err != nil {
-			slog.Warn("initial solar forecast failed", "error", err)
-		}
+		h.maybeRefreshSolar(ctx, time.Now().In(h.cfg.Location()))
 	} else {
 		slog.Info("solcast API key not configured, skipping solar forecast")
 	}
@@ -337,9 +341,22 @@ func (h *Hub) buildChargePlan(now time.Time, slot *optimizer.Slot, socKnown bool
 	return actuator.ChargePlan{Charging: charging, GridKW: gridKW, Window: win}
 }
 
-// since the cache was last fetched. A NIL cache (the initial fetch failed, or has
+// maybeRefreshSolar fetches a new solar forecast only when one of the
+// configured poll_times has passed and the cache is still older than that
+// target — i.e. it gates on how long it's been (in wall-clock, poll_times
+// terms) since the cache was last fetched. A NIL cache (the initial fetch failed, or has
 // not run) must TRIGGER a rate-limited retry — not suppress fetching for the whole
 // process life — so a single startup failure is recoverable (M3 fix).
+//
+// This is also the entry point Run uses for the STARTUP fetch (not just the
+// tick loop): h.solcast is constructed with any forecast persisted by a prior
+// process already loaded into its cache (forecast.NewSolcast reads the cache
+// file at CacheDir), so on a restart that lands within the poll_times window
+// `cached` here is that persisted forecast — still "fresh" by the same test
+// above — and the poll-time loop returns without calling Fetch at all. That's
+// what makes a restart free: no cache age special-case is needed, the normal
+// poll_times gate already treats a reloaded cache identically to one fetched
+// earlier in the same process.
 func (h *Hub) maybeRefreshSolar(ctx context.Context, now time.Time) {
 	cached := h.solcast.Cached()
 	if cached == nil {

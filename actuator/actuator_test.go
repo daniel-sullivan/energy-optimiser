@@ -18,11 +18,12 @@ import (
 // --- test doubles ---
 
 type recordedCall struct {
-	domain  string
-	service string
-	entity  string
-	option  string
-	value   float64
+	domain      string
+	service     string
+	entity      string
+	option      string
+	value       float64
+	prioAtWrite string // for set_value: output_priority state visible at write time
 }
 
 // fakeHA records service calls and reflects successful writes into its state
@@ -42,6 +43,20 @@ type fakeHA struct {
 	// cache is NOT updated, so the actuator's advisory read-back times out even
 	// though the write physically landed (the C1 double-spend hazard).
 	decoupleSelect bool
+
+	// selectEchoDelay models the SLOW SRNE state feed: a select_option write is
+	// acked immediately but only becomes visible in the state cache after this
+	// wall-clock delay. Used to prove the enter waits for UTI to APPLY before the
+	// amps write. Zero ⇒ immediate echo (unless decoupleSelect).
+	selectEchoDelay time.Duration
+	pendingSelEnt   string
+	pendingSelVal   string
+	pendingSelAt    time.Time
+
+	// dropFirstAmps models the SRNE dropping a rapid-fire consecutive write: the
+	// first set_value (amps) is acked but NOT reflected into the state cache.
+	dropFirstAmps bool
+	sawFirstAmps  bool
 
 	// panicNextCall makes the next CallServiceAck panic once (then clears),
 	// modelling a fault reaching the HA client mid-transition (H3 recovery).
@@ -75,18 +90,33 @@ func (f *fakeHA) CallServiceAck(_ context.Context, domain, service string, data 
 	if v, ok := data["value"].(float64); ok {
 		c.value = v
 	}
+	if service == "set_value" {
+		c.prioAtWrite = f.states[prioEntity]
+	}
 	f.calls = append(f.calls, c)
 	if f.ackErr != nil {
 		return f.ackErr
 	}
-	// Reflect the write so read-back sees it — unless select echoes are decoupled.
+	// Reflect the write so read-back sees it — modelling the SRNE's echo behaviour.
 	switch service {
 	case "select_option":
-		if !f.decoupleSelect {
+		switch {
+		case f.selectEchoDelay > 0:
+			// Slow feed: becomes visible only after selectEchoDelay (see State).
+			f.pendingSelEnt = c.entity
+			f.pendingSelVal = c.option
+			f.pendingSelAt = time.Now().Add(f.selectEchoDelay)
+		case f.decoupleSelect:
+			// Never echoes.
+		default:
 			f.states[c.entity] = c.option
 		}
 	case "set_value":
-		f.states[c.entity] = strconv.FormatFloat(c.value, 'f', -1, 64)
+		if f.dropFirstAmps && !f.sawFirstAmps {
+			f.sawFirstAmps = true // dropped: acked but not reflected
+		} else {
+			f.states[c.entity] = strconv.FormatFloat(c.value, 'f', -1, 64)
+		}
 	}
 	return nil
 }
@@ -94,6 +124,12 @@ func (f *fakeHA) CallServiceAck(_ context.Context, domain, service string, data 
 func (f *fakeHA) State(entityID string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Promote a delayed select echo once its wall-clock deadline has passed.
+	if f.pendingSelEnt == entityID && !f.pendingSelAt.IsZero() && !time.Now().Before(f.pendingSelAt) {
+		f.states[entityID] = f.pendingSelVal
+		f.pendingSelAt = time.Time{}
+		f.pendingSelEnt = ""
+	}
 	return f.states[entityID]
 }
 
@@ -152,6 +188,33 @@ func (f *fakeHA) totalCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
+}
+
+// ampsWriteCount counts set_value writes to the amps entity (each a retry/adjust).
+func (f *fakeHA) ampsWriteCount(entity string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if c.service == "set_value" && c.entity == entity {
+			n++
+		}
+	}
+	return n
+}
+
+// firstAmpsWritePrio returns the output_priority state visible at the moment the
+// FIRST amps write was issued — used to prove the enter gated the amps write on
+// UTI having applied.
+func (f *fakeHA) firstAmpsWritePrio(entity string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c.service == "set_value" && c.entity == entity {
+			return c.prioAtWrite
+		}
+	}
+	return ""
 }
 
 type fakeClock struct {
@@ -246,11 +309,20 @@ func newActuator(t *testing.T, mode Mode, now time.Time, initialPriority string)
 		t.Fatal(err)
 	}
 	a.now = clock.now
+	fastSettle(a)
 	if err := a.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(a.Close)
 	return a, fake, clock
+}
+
+// fastSettle shrinks the write-spacing knobs so the suite exercises the settle/
+// retry paths without real multi-second sleeps (production defaults are seconds).
+func fastSettle(a *Actuator) {
+	a.settleTimeout = 200 * time.Millisecond
+	a.settleDelay = time.Millisecond
+	a.settlePoll = 5 * time.Millisecond
 }
 
 func mustPlan(t *testing.T, a *Actuator, plan ChargePlan) {
@@ -467,6 +539,7 @@ func TestReconcilePreservesBudgetAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	a1.now = func() time.Time { return inWindow }
+	fastSettle(a1)
 	if err := a1.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -483,6 +556,7 @@ func TestReconcilePreservesBudgetAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	a2.now = func() time.Time { return inWindow }
+	fastSettle(a2)
 	if err := a2.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -710,6 +784,7 @@ func TestPersistAtomicAndCorruptColdStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.now = func() time.Time { return inWindow }
+	fastSettle(a)
 	if err := a.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -794,5 +869,125 @@ func TestNoEnterForZeroGridCharge(t *testing.T) {
 	}
 	if a.ep.inBypass || a.ep.entered {
 		t.Fatalf("zero grid-charge must not mark entered/inBypass, got %+v", a.ep)
+	}
+}
+
+// --- C2: space consecutive inverter writes (the live-trigger-test finding) ---
+
+// TestEnterWaitsForUTIAppliedBeforeAmps proves the enter GATES the amps write on
+// the output_priority having actually APPLIED (UTI visible in the state feed), not
+// merely on the service ack. The SRNE controller drops a rapid-fire second write;
+// the fix waits for the (slow) UTI echo before issuing amps, so the amps write is
+// not dropped. Exactly ONE output_priority write (one blip) must occur.
+func TestEnterWaitsForUTIAppliedBeforeAmps(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	// The SRNE echoes UTI only after a delay (slow state feed).
+	fake.mu.Lock()
+	fake.selectEchoDelay = 60 * time.Millisecond
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+
+	if got := fake.selectCalls(prioEntity); got != 1 {
+		t.Fatalf("enter must be exactly one output_priority blip, got %d", got)
+	}
+	// The amps write must have been issued only AFTER output_priority read UTI.
+	if seen := fake.firstAmpsWritePrio(ampsEntity); seen != "UTI" {
+		t.Fatalf("amps write must be gated on UTI-applied; output_priority read %q at amps-write time", seen)
+	}
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatalf("amps must be written nonzero after UTI applied, got %v", v)
+	}
+	if !a.ep.entered || !a.ep.inBypass {
+		t.Fatalf("enter must remain entered/inBypass, got %+v", a.ep)
+	}
+}
+
+// TestDroppedAmpsRetriedAndLands proves a dropped mains-charge-current write is
+// retried within the same tick and lands, with NO extra output_priority blip.
+func TestDroppedAmpsRetriedAndLands(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	fake.mu.Lock()
+	fake.dropFirstAmps = true // SRNE drops the first amps write
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatalf("dropped amps write must be retried and land nonzero, got %v", v)
+	}
+	if got := fake.ampsWriteCount(ampsEntity); got < 2 {
+		t.Fatalf("dropped amps write must be retried at least once, got %d amps writes", got)
+	}
+	if got := fake.selectCalls(prioEntity); got != 1 {
+		t.Fatalf("amps retry must not add output_priority blips; want 1, got %d", got)
+	}
+}
+
+// TestSettleTimeoutStillSendsAmpsNoExtraBlip proves that when UTI never echoes
+// (settle wait times out — the slow-feed worst case), the actuator still sends the
+// amps write (advisory), does NOT reverse the blip, does NOT fail-safe, and stays
+// entered. This is the C1-safety guarantee applied to the new settle gate.
+func TestSettleTimeoutStillSendsAmpsNoExtraBlip(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	// UTI never echoes → the settle poll times out.
+	fake.mu.Lock()
+	fake.decoupleSelect = true
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+
+	if got := fake.selectCalls(prioEntity); got != 1 {
+		t.Fatalf("settle timeout must not add a blip; want 1 output_priority write, got %d", got)
+	}
+	if last := fake.lastSelect(prioEntity); last != "UTI" {
+		t.Fatalf("settle timeout must not reverse to SBU; last select=%q", last)
+	}
+	if !a.ep.entered || !a.ep.inBypass {
+		t.Fatalf("settle timeout must keep entered/inBypass; got %+v", a.ep)
+	}
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatalf("settle timeout must still send amps (advisory), got %v", v)
+	}
+}
+
+// TestExitSpacedDroppedSBUCaughtByWatchdog proves the spaced exit is still exactly
+// one exit blip (2 per window total), and that a DROPPED SBU exit (echo never
+// lands, hardware stays UTI outside the window) is re-safed by the watchdog.
+func TestExitSpacedDroppedSBUCaughtByWatchdog(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, "SBU")
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter (blip 1)
+
+	// Model the SRNE dropping the SBU exit write: select_option(SBU) is issued
+	// (blip 2) but the state never echoes SBU (stays UTI).
+	fake.mu.Lock()
+	fake.decoupleSelect = true
+	fake.mu.Unlock()
+	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID}) // exit (blip 2)
+
+	if got := fake.selectCalls(prioEntity); got != 2 {
+		t.Fatalf("enter+exit must be exactly 2 blips per window, got %d", got)
+	}
+	if last := fake.lastSelect(prioEntity); last != "SBU" {
+		t.Fatalf("exit must write SBU, got %q", last)
+	}
+
+	// Physically still UTI outside the window (dropped SBU) → watchdog re-safes.
+	clock.set(outWindow)
+	fake.mu.Lock()
+	fake.decoupleSelect = false // allow the re-safe to take effect
+	fake.states[prioEntity] = "UTI"
+	fake.mu.Unlock()
+	submitSync(t, a, command{kind: cmdWatchdog})
+	if fake.lastSelect(prioEntity) != "SBU" {
+		t.Fatalf("watchdog must re-safe a dropped SBU exit; last=%q", fake.lastSelect(prioEntity))
 	}
 }

@@ -74,7 +74,7 @@ type AccChart struct {
 
 // AccSeries is one line in a chart: predicted (dashed) or actual (solid).
 type AccSeries struct {
-	Label  string // "Measured" / "Solcast" / "Learned model" / "Planned"
+	Label  string // "Measured" / "Solcast" / "Expected (weather)" / "Planned"
 	Accent string // css accent token: solar / charge / discharge / model
 	Dashed bool
 	Path   string // SVG path; broken into sub-paths across gaps
@@ -82,7 +82,7 @@ type AccSeries struct {
 
 // AccStat is one error summary (per predictor) over the paired points.
 type AccStat struct {
-	Label string // "Solcast" / "Learned model" / "Planned"
+	Label string // "Solcast" / "Expected (weather)" / "Planned"
 	Value string // "MAE 0.42 · RMSE 0.61 kW  (n=48)"
 }
 
@@ -162,12 +162,12 @@ func (s *Server) buildSolarChart(pts []AccuracyPoint, n int) AccChart {
 	c.YTop, c.YBot = fmt.Sprintf("%.1f kW", peak), "0"
 	c.Series = []AccSeries{
 		{Label: "Solcast", Accent: "solar", Dashed: true, Path: seriesPath(pts, n, solcast, y)},
-		{Label: "Learned model", Accent: "model", Dashed: true, Path: seriesPath(pts, n, model, y)},
+		{Label: "Expected (weather)", Accent: "model", Dashed: true, Path: seriesPath(pts, n, model, y)},
 		{Label: "Measured", Accent: "solar", Path: seriesPath(pts, n, actual, y)},
 	}
 	c.Stats = []AccStat{
 		errStat("Solcast", pts, solcast, actual, "kW", 1),
-		errStat("Learned model", pts, model, actual, "kW", 1),
+		errStat("Expected (weather)", pts, model, actual, "kW", 1),
 	}
 	c.Pending, c.Note = pendingState(c.Stats, "Measured PV pending — accuracy fills in as slots elapse.")
 	return c

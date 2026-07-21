@@ -27,6 +27,28 @@ const adjustEpsilon = 0.5
 // toward the current ceiling. Below this, kW→A falls back to nominal voltage.
 const minPlausibleVoltageV = 40.0
 
+// Write-spacing constants. The SRNE controller drops rapid-fire consecutive
+// writes ("space writes" — a documented behaviour of this inverter/controller):
+// a second inverter write issued while it is still processing the previous one
+// (e.g. the amps write landing while the bypass transition is still settling) is
+// silently dropped. The enter sequence is therefore spaced — after the
+// output_priority (UTI) write we wait for the inverter to actually APPLY it, then
+// pause, before issuing the mains-charge-current write.
+const (
+	// writeSettleTimeout bounds the poll that waits for an output_priority write
+	// to be echoed back by the (slow) SRNE state feed before the following write
+	// is issued. Generous because the SRNE echo lags seconds behind the ack. On
+	// timeout the following write proceeds anyway (advisory) — the blip is already
+	// spent and the next-tick doAdjust recovers; see doEnter.
+	writeSettleTimeout = 15 * time.Second
+	// writeSettlePollInterval is the cadence of the settle/read-back poll while
+	// waiting for a write to apply.
+	writeSettlePollInterval = 1 * time.Second
+	// writeSettleDelay spaces ANY two consecutive inverter writes (enter: UTI→amps;
+	// exit: amps0→SBU) so the second is not dropped by the controller.
+	writeSettleDelay = 1500 * time.Millisecond
+)
+
 var errClosed = errors.New("actuator: closed")
 
 // haClient is the slice of the Home Assistant client the actuator needs. The
@@ -81,6 +103,12 @@ type Actuator struct {
 	// now is the clock, injectable in tests.
 	now func() time.Time
 
+	// Write-spacing knobs. Default to the package consts; tests override them to
+	// keep the suite fast (real device latency is seconds).
+	settleTimeout time.Duration
+	settleDelay   time.Duration
+	settlePoll    time.Duration
+
 	// Goroutine-owned (loop only):
 	ep            episode
 	boundaryTimer *time.Timer
@@ -122,6 +150,10 @@ func New(cfg config.ActuatorHW, battery config.Battery, rates *config.Rates, ha 
 		cmds:    make(chan command, 8),
 		closed:  make(chan struct{}),
 		now:     time.Now,
+
+		settleTimeout: writeSettleTimeout,
+		settleDelay:   writeSettleDelay,
+		settlePoll:    writeSettlePollInterval,
 	}
 	slog.Info("actuator: initialised",
 		"mode", mode,
@@ -365,14 +397,26 @@ func (a *Actuator) doEnter(amps float64, win config.OffPeakOccurrence) error {
 	a.armBoundary(win)
 	a.persist()
 
-	// Advisory read-back: a mismatch/timeout is logged but must NOT reverse state
-	// or trigger a safe (the blip already happened; reversing causes a second one).
-	if err := a.verifyPriority(a.cfg.UtilityOption); err != nil {
-		slog.Warn("actuator: ENTER read-back did not confirm within read_back_timeout "+
-			"(advisory only — blip already spent, staying entered)", "error", err)
+	// Space consecutive inverter writes: WAIT for the output_priority (UTI) write to
+	// actually APPLY on the inverter before issuing the amps write. The SRNE
+	// controller drops a second write issued while it is still processing the bypass
+	// transition ("space writes"), which would silently strand this first charge slot
+	// at 0 A until the next tick's doAdjust re-sends it (up to 5 min late). Poll the
+	// echoed state (generous settle timeout — the SRNE echo is slow).
+	//
+	// ADVISORY (preserves C1): a settle-poll timeout means the echo lagged, NOT that
+	// the write failed. It MUST NOT reverse entered/inBypass or trigger doSafe (that
+	// is the exact C1 bug — an extra blip). On timeout we still issue the amps write
+	// and let the next tick recover.
+	if err := a.pollState(a.cfg.OutputPrioritySelect, a.cfg.UtilityOption, a.settleTimeout, a.settlePoll); err != nil {
+		slog.Warn("actuator: ENTER — output_priority did not read UTI within settle timeout "+
+			"(advisory only — blip already spent, proceeding with amps write; next tick recovers)", "error", err)
 	}
+	// Space the amps write from the priority write regardless of how the settle poll
+	// resolved, to respect the controller's "space writes" requirement.
+	a.pause()
 
-	if err := a.writeAmps(amps); err != nil {
+	if err := a.writeAmpsConfirmed(amps); err != nil {
 		// In bypass but amps unconfirmed — the next tick's adjust retries. Do NOT
 		// exit (would waste the exit blip).
 		a.ep.amps = 0
@@ -419,6 +463,10 @@ func (a *Actuator) doExit(reason string) error {
 	if err := a.writeAmps(0); err != nil {
 		errs = append(errs, err)
 	}
+	// Space the SBU write from the amps=0 write — a dropped SBU is the dangerous one
+	// (strand-in-bypass), so we must not let the controller drop it as a rapid-fire
+	// consecutive write. writePriority still confirms SBU via an advisory read-back.
+	a.pause()
 	if err := a.writePriority(a.cfg.BatteryOption); err != nil {
 		errs = append(errs, err)
 	}
@@ -451,6 +499,9 @@ func (a *Actuator) doSafe(reason string, force bool) error {
 	if err := a.writeAmps(0); err != nil {
 		errs = append(errs, err)
 	}
+	// Space the SBU write (see doExit): a dropped SBU would leave the inverter
+	// stranded in bypass, the exact hazard the fail-safe exists to prevent.
+	a.pause()
 	if err := a.writePriority(a.cfg.BatteryOption); err != nil {
 		errs = append(errs, err)
 	}
@@ -672,12 +723,73 @@ func (a *Actuator) writeAmps(amps float64) error {
 	return nil
 }
 
+// writeAmpsConfirmed sets a NONZERO mains-charge-current, then verifies the SRNE
+// echoed it back; if the controller dropped the write (read-back stays ~0 — the
+// "space writes" symptom that the live trigger test caught), it retries ONCE,
+// spaced, before relying on the next-tick doAdjust. Amps writes are non-blip, so
+// the retry carries no blip-budget cost. A zero command is not confirmed (nothing
+// to distinguish from a dropped write, and stop/exit have their own safety nets).
+func (a *Actuator) writeAmpsConfirmed(amps float64) error {
+	if err := a.writeAmps(amps); err != nil {
+		return err
+	}
+	if round1(amps) <= 0 || a.ampsLanded(amps) {
+		return nil
+	}
+	slog.Warn("actuator: mains_charge_current write appears DROPPED (read-back stayed ~0) — "+
+		"retrying once, spaced", "amps", round1(amps))
+	a.pause()
+	if err := a.writeAmps(amps); err != nil {
+		return err
+	}
+	if !a.ampsLanded(amps) {
+		slog.Warn("actuator: mains_charge_current retry still unconfirmed — next-tick adjust will re-send",
+			"amps", round1(amps))
+	}
+	return nil
+}
+
+// ampsLanded polls the mains-charge-current read-back until it reflects the
+// commanded setpoint (within adjustEpsilon), bounded by the settle timeout (the
+// SRNE echo is slow). Returns false if it never converges — i.e. the write was
+// dropped. Bounds on REAL elapsed time so it terminates under a frozen test clock.
+func (a *Actuator) ampsLanded(want float64) bool {
+	target := round1(want)
+	deadline := time.Now().Add(a.settleTimeout)
+	for {
+		if math.Abs(a.ha.StateFloat(a.cfg.MainsChargeCurrentNumber)-target) < adjustEpsilon {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(a.settlePoll)
+	}
+}
+
+// pause spaces two consecutive inverter writes (the SRNE "space writes"
+// requirement). It sleeps the settle delay; the loop goroutine is the sole writer
+// so blocking it briefly is safe (async watchdog/boundary commands buffer).
+func (a *Actuator) pause() {
+	if a.settleDelay > 0 {
+		time.Sleep(a.settleDelay)
+	}
+}
+
 // verifyState polls the state cache until the entity reports want, or the
-// configured (advisory) read-back timeout elapses. It bounds on REAL elapsed
-// time (not the injectable clock) so it terminates deterministically even under a
-// frozen test clock — the poll tracks real device state-propagation latency.
+// configured (advisory) read-back timeout elapses.
 func (a *Actuator) verifyState(entityID, want string) error {
-	deadline := time.Now().Add(a.cfg.ReadBackTimeout.Duration)
+	return a.pollState(entityID, want, a.cfg.ReadBackTimeout.Duration, 50*time.Millisecond)
+}
+
+// pollState polls the state cache until the entity reports want, or timeout
+// elapses. It bounds on REAL elapsed time (not the injectable clock) so it
+// terminates deterministically even under a frozen test clock — the poll tracks
+// real device state-propagation latency. Used both for the advisory exit/safe
+// read-back (short ReadBackTimeout) and the enter settle-wait (generous
+// settleTimeout, since read_back_timeout=8s is too tight for the slow SRNE echo).
+func (a *Actuator) pollState(entityID, want string, timeout, poll time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	for {
 		if got := a.ha.State(entityID); got == want {
 			return nil
@@ -685,7 +797,7 @@ func (a *Actuator) verifyState(entityID, want string) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("read-back %s: want %q, have %q", entityID, want, a.ha.State(entityID))
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(poll)
 	}
 }
 

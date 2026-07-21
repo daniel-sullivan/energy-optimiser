@@ -93,6 +93,12 @@ type Solcast struct {
 	APIKey    string        `toml:"api_key"`
 	Sites     []SolcastSite `toml:"sites"`
 	PollTimes []TimeOfDay   `toml:"poll_times"`
+	// CacheDir persists the last fetched forecast to disk so a restart reuses
+	// it instead of re-fetching — Solcast's free tier enforces a low daily
+	// request cap that a handful of restarts can exhaust. Defaults to
+	// PVModel.DataDir, the same persistent volume the PV model and actuator
+	// state already use.
+	CacheDir string `toml:"cache_dir"`
 }
 
 // SolcastSite is one rooftop site; per-site forecasts are summed. Tilt/Azimuth
@@ -458,6 +464,10 @@ func (c *Config) finalize() error {
 	}
 	if c.PVModel.MinSamples == 0 {
 		c.PVModel.MinSamples = 12
+	}
+
+	if c.Solcast.CacheDir == "" {
+		c.Solcast.CacheDir = c.PVModel.DataDir
 	}
 
 	c.finalizeActuator()

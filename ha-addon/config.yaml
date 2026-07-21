@@ -1,7 +1,7 @@
 name: Energy Optimiser
 description: Forecast-driven off-peak battery charge optimiser for solar + battery systems
 slug: energy-optimiser
-version: 0.2.2
+version: 0.2.3
 url: https://github.com/daniel-sullivan/energy-optimiser
 arch:
   - amd64
