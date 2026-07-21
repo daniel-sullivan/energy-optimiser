@@ -50,7 +50,7 @@ type Hub struct {
 	decisionPub *serve.DecisionPublisher
 	server      *serve.Server
 	dryRun      bool
-	observe     bool
+	mode        actuator.Mode
 
 	mu          sync.RWMutex
 	schedule    *optimizer.Schedule
@@ -70,6 +70,10 @@ type Hub struct {
 }
 
 func New(cfg *config.Config, dryRun bool) (*Hub, error) {
+	mode, err := actuator.ResolveMode(cfg.Mode, cfg.Observe, dryRun)
+	if err != nil {
+		return nil, fmt.Errorf("actuator mode: %w", err)
+	}
 	h := &Hub{
 		cfg:         cfg,
 		solcast:     forecast.NewSolcast(cfg.Solcast),
@@ -77,7 +81,7 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		loadModel:   loadmodel.New(cfg.Circuits, cfg.HomeAssistant.Entities.LoadPower),
 		ha:          ha.New(cfg.HomeAssistant),
 		dryRun:      dryRun,
-		observe:     cfg.Observe,
+		mode:        mode,
 		subscribers: make(map[*serve.Subscriber]struct{}),
 	}
 	h.notifier = alert.NewNotifier(cfg)
@@ -101,8 +105,9 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		h.pvModel = pm
 	}
 
-	// Actuator — skips MQTT connection in dry-run
-	act, err := actuator.New(cfg.MQTT, h.ha, dryRun)
+	// Actuator — Phase-1 blip-safe grid-charge control. Defaults to observe
+	// (no inverter writes); live actuation requires an explicit mode = "live".
+	act, err := actuator.New(cfg.ActuatorHW, cfg.Battery, &cfg.Rates, h.ha, mode)
 	if err != nil {
 		if h.influx != nil {
 			_ = h.influx.Close()
@@ -149,6 +154,13 @@ func (h *Hub) Run(ctx context.Context) error {
 	}
 	if err := h.ha.SubscribeEvents(ctx); err != nil {
 		return fmt.Errorf("ha subscribe: %w", err)
+	}
+
+	// Reconcile the actuator against the live inverter state and start its
+	// write-owning goroutine + watchdog before the first tick. Non-fatal: a
+	// reconcile write error is logged; the watchdog will retry.
+	if err := h.actuator.Start(ctx); err != nil {
+		slog.Warn("actuator startup reconcile", "error", err)
 	}
 
 	// Connect the decision publisher and announce its HA-discovery entities.
@@ -222,7 +234,7 @@ func (h *Hub) tick(ctx context.Context) {
 	// Floor to the slot boundary so solar/load vectors, tariff windows, and the
 	// schedule grid all align (PrepareInput floors too; keep them consistent).
 	now := time.Now().In(h.cfg.Location()).Truncate(h.cfg.Service.SlotDuration.Duration)
-	slog.Info("tick", "time", now.Format(time.TimeOnly))
+	slog.Info("tick", "time", now.Format(time.TimeOnly), "actuator_mode", h.mode)
 
 	if h.cfg.Solcast.APIKey != "" {
 		h.maybeRefreshSolar(ctx, now)
@@ -230,10 +242,12 @@ func (h *Hub) tick(ctx context.Context) {
 	h.maybeRefreshWeather(ctx, now)
 
 	currentSOC := h.ha.StateFloat(h.cfg.HomeAssistant.Entities.BatterySOC) / 100.0
-	if currentSOC == 0 {
-		slog.Warn("battery SOC reading is 0 — HA entity may not be reporting yet",
+	socKnown := currentSOC > 0
+	if !socKnown {
+		slog.Warn("battery SOC reading is 0/unknown — HA entity may not be reporting yet; "+
+			"solving on an assumed SOC for the dashboard but NOT actuating",
 			"entity", h.cfg.HomeAssistant.Entities.BatterySOC)
-		currentSOC = 0.5 // safe default
+		currentSOC = 0.5 // assumed value for the schedule/dashboard only, never actuated on
 	}
 
 	// Build the telescoping slot grid once and thread it through the forecast and
@@ -255,13 +269,13 @@ func (h *Hub) tick(ctx context.Context) {
 
 	slot := sched.CurrentSlot(now)
 	if slot != nil {
-		if h.observe {
-			slog.Info("observe mode — not actuating", "would_grid_charge", slot.GridCharge)
-			h.notifier.Evaluate(ctx, now, sched, currentSOC)
-		} else if err := h.actuator.SetGridCharge(slot.GridCharge); err != nil {
-			slog.Error("set grid charge", "error", err)
+		plan := h.buildChargePlan(now, slot, socKnown)
+		if err := h.actuator.SetChargePlan(ctx, plan); err != nil {
+			slog.Error("actuator set charge plan", "error", err)
 		}
 	}
+	// Advisory decision/risk notifications run in every mode (they never actuate).
+	h.notifier.Evaluate(ctx, now, sched, currentSOC)
 
 	h.recordDecision(ctx, now, slot)
 	h.publishDecision(now, slot, sched, currentSOC)
@@ -284,7 +298,23 @@ func (h *Hub) tick(ctx context.Context) {
 	h.broadcast()
 }
 
-// maybeRefreshSolar refreshes the Solcast forecast when a poll time has passed
+// buildChargePlan derives the actuator's desired grid-charge state from the
+// current slot. It commands the GRID SHARE — the grid kW needed after expected
+// PV self-charge — never gross battery flow, and only ever inside an active
+// off-peak window. When the SOC is unknown it never initiates charging (the
+// solve ran on an assumed SOC purely for the dashboard).
+func (h *Hub) buildChargePlan(now time.Time, slot *optimizer.Slot, socKnown bool) actuator.ChargePlan {
+	win, off := h.cfg.Rates.ActiveWindow(now)
+	charging := socKnown && slot.GridCharge && off
+	var gridKW float64
+	if charging {
+		batteryChargeKW := math.Max(0, slot.BatteryFlowKW) // positive = charging
+		pvSurplus := math.Max(0, slot.SolarKW-slot.LoadKW) // PV available to self-charge
+		gridKW = math.Max(0, batteryChargeKW-pvSurplus)
+	}
+	return actuator.ChargePlan{Charging: charging, GridKW: gridKW, Window: win}
+}
+
 // since the cache was last fetched. A NIL cache (the initial fetch failed, or has
 // not run) must TRIGGER a rate-limited retry — not suppress fetching for the whole
 // process life — so a single startup failure is recoverable (M3 fix).

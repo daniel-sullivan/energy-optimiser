@@ -3,8 +3,16 @@ time_zone = "Asia/Tokyo"
 
 # observe = true: run the optimizer, publish the dashboard + HA decision/
 # time-remaining entities + recommendation notifications, but DO NOT actuate the
-# inverter. Set false only once you're ready for live grid-charge control.
+# inverter. Retained for back-compat; `mode` (below) is the primary control.
 observe = false
+
+# mode selects the actuator behaviour (the Phase-1 blip-safe grid-charge control):
+#   "observe"  — compute + log only, no inverter writes (the safe default)
+#   "watchdog" — only the fail-safe path may write; never initiates charging
+#   "live"     — full grid-charge control
+# Empty/unset resolves to "observe"; live actuation is only ever reached by an
+# explicit mode = "live". Leave this at observe until the supervised rollout.
+mode = "observe"
 
 [service]
 poll_interval = "5m"
@@ -92,6 +100,24 @@ device_id = "srne_system"                 # actuation target: your inverter's MQ
 # decision_device_id = "energy_optimiser" # this app's own HA-discovery device for the plan + time-remaining (default: energy_optimiser)
 # username = ""                           # MQTT broker auth (blank = anonymous); supports env:VARNAME
 # password = ""
+
+# Phase-1 blip-safe grid-charge actuator. The only working grid-charge path on
+# this ASP/SRNE inverter is output_priority→UTI (utility bypass = one power blip)
+# then mains_charge_current > 0; rate changes are amps-only (no blip); exit is
+# output_priority→SBU (one blip). All fields have sensible SRNE-add-on defaults.
+[actuator]
+# output_priority_select = "select.srne_solar_system_output_priority"
+# mains_charge_current_number = "number.srne_solar_system_mains_charge_current"
+# battery_voltage_sensor = "sensor.srne_solar_system_battery_voltage"
+# utility_option = "UTI"          # exact select option for utility bypass (verified at runtime)
+# battery_option = "SBU"          # exact select option for battery-priority
+# num_units = 2                   # parallel inverter units the per-unit current applies to
+# max_charge_current_a = 100      # per-unit current clamp (A)
+# state_dir = "/data"             # persists the per-window blip budget across restart (default: pv_model.data_dir)
+# watchdog_interval = "30s"       # cadence of the never-stuck-in-bypass safety check
+# write_timeout = "10s"           # per inverter write + ack
+# voltage_stale = "5m"            # battery-voltage reading older than this → nominal-voltage fallback
+# state_stale = "5m"              # output-priority reading older than this → watchdog fail-safe
 
 [alertmanager]
 # url = "http://alertmanager:9093"        # POST decision/risk alerts to an Alertmanager (blank = disabled); it routes to Discord/etc.

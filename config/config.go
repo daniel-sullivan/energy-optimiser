@@ -20,6 +20,7 @@ type Config struct {
 	Optimizer     Optimizer     `toml:"optimizer"`
 	PVModel       PVModel       `toml:"pv_model"`
 	MQTT          MQTT          `toml:"mqtt"`
+	ActuatorHW    ActuatorHW    `toml:"actuator"`
 	Alertmanager  Alertmanager  `toml:"alertmanager"`
 	Alerts        Alerts        `toml:"alerts"`
 	Circuits      []Circuit     `toml:"circuit"`
@@ -30,8 +31,16 @@ type Config struct {
 
 	// Observe runs the optimizer and publishes the dashboard + HA decision/
 	// time-remaining entities WITHOUT actuating the inverter — a supervised
-	// rollout step before enabling live grid-charge control.
+	// rollout step before enabling live grid-charge control. Retained for
+	// back-compat; Mode (below) is the primary control and defaults to observe.
 	Observe bool `toml:"observe"`
+
+	// Mode selects the actuator behaviour: "observe" (compute + log only, no
+	// inverter writes — the safe default), "watchdog" (only the fail-safe path
+	// may write; never initiates charging), or "live" (full grid-charge control).
+	// Empty resolves to observe, so live actuation is only ever reached by an
+	// explicit mode = "live".
+	Mode string `toml:"mode"`
 
 	loc *time.Location
 }
@@ -172,6 +181,50 @@ func (r *Rates) IsOffPeak(t time.Time) bool {
 	return false
 }
 
+// OffPeakOccurrence is a concrete off-peak window resolved to absolute instants,
+// with a stable ID unique to this occurrence (used to key the actuator's
+// per-window blip budget and to arm the window-end boundary timer).
+type OffPeakOccurrence struct {
+	Start time.Time
+	End   time.Time
+	Rate  float64
+	ID    string
+}
+
+// ActiveWindow returns the off-peak occurrence containing t as an absolute
+// [Start, End) interval, or ok=false when t is peak. Windows are matched against
+// today's and yesterday's anchoring so a window wrapping midnight is handled.
+func (r *Rates) ActiveWindow(t time.Time) (OffPeakOccurrence, bool) {
+	if r.loc != nil {
+		t = t.In(r.loc)
+	}
+	for _, w := range r.OffPeakWindows {
+		for _, dayOffset := range [...]int{0, -1} {
+			day := t.AddDate(0, 0, dayOffset)
+			start := time.Date(day.Year(), day.Month(), day.Day(),
+				w.Start.Hour, w.Start.Minute, 0, 0, t.Location())
+			end := time.Date(day.Year(), day.Month(), day.Day(),
+				w.End.Hour, w.End.Minute, 0, 0, t.Location())
+			if !end.After(start) { // wraps past midnight
+				end = end.AddDate(0, 0, 1)
+			}
+			if !t.Before(start) && t.Before(end) {
+				rate := w.Rate
+				if rate <= 0 {
+					rate = r.OffPeakRate
+				}
+				return OffPeakOccurrence{
+					Start: start,
+					End:   end,
+					Rate:  rate,
+					ID:    start.Format(time.RFC3339),
+				}, true
+			}
+		}
+	}
+	return OffPeakOccurrence{}, false
+}
+
 type Optimizer struct {
 	SOCRiskWeight       float64 `toml:"soc_risk_weight"`
 	ConfidenceThreshold float64 `toml:"confidence_threshold"`
@@ -234,6 +287,62 @@ func (m MQTT) CommandTopic(component, key string) string {
 // StateTopic returns the MQTT topic for reading state.
 func (m MQTT) StateTopic(component, key string) string {
 	return fmt.Sprintf("%s/%s/%s/%s/state", m.TopicPrefix, component, m.DeviceID, key)
+}
+
+// ActuatorHW configures the Phase-1 blip-safe grid-charge actuator: the HA
+// entities it writes/reads and the kW→A conversion. The only working grid-charge
+// path on this ASP/SRNE inverter is output_priority→UTI (utility bypass, one
+// power blip) then mains_charge_current > 0; rate changes are amps-only (no
+// blip); exit is output_priority→SBU (one blip). Entity IDs are config-driven
+// with sensible SRNE-add-on defaults.
+type ActuatorHW struct {
+	// OutputPrioritySelect is the select entity toggling bypass (UTI) vs
+	// battery-priority (SBU). Writing it is the ONLY operation that blips power.
+	OutputPrioritySelect string `toml:"output_priority_select"`
+	// MainsChargeCurrentNumber is the per-unit grid-charge current (A) number
+	// entity. Changing it while already in bypass is blip-free.
+	MainsChargeCurrentNumber string `toml:"mains_charge_current_number"`
+	// BatteryVoltageSensor is the live pack-voltage sensor used for kW→A; falls
+	// back to Battery.NominalVoltageV when stale/unavailable.
+	BatteryVoltageSensor string `toml:"battery_voltage_sensor"`
+
+	// UtilityOption / BatteryOption are the exact select option strings for
+	// bypass and battery-priority. Verified against the select's options at
+	// runtime; these are defaults only.
+	UtilityOption string `toml:"utility_option"`
+	BatteryOption string `toml:"battery_option"`
+
+	// NumUnits is the count of parallel inverter units the per-unit current is
+	// applied to (the pack current is NumUnits × per-unit amps).
+	NumUnits int `toml:"num_units"`
+	// MaxChargeCurrentA clamps the commanded per-unit current (A).
+	MaxChargeCurrentA float64 `toml:"max_charge_current_a"`
+	// MaxChargeKW is the AGGREGATE grid-charge ceiling (kW) applied to the whole
+	// pack BEFORE the kW→A conversion, so a high per-unit amp headroom can never
+	// command more than the pack can accept. Defaults to Battery.MaxChargeKW (or
+	// 8 kW when that too is unset). Bounds the per-unit clamp as a second limit.
+	MaxChargeKW float64 `toml:"max_charge_kw"`
+
+	// StateDir persists the per-window blip-budget episode so a mid-window
+	// restart cannot spend a second enter-blip.
+	StateDir string `toml:"state_dir"`
+
+	// WatchdogInterval is the cadence of the independent never-stuck-in-bypass
+	// safety check. WriteTimeout bounds each inverter write+ack.
+	WatchdogInterval Duration `toml:"watchdog_interval"`
+	WriteTimeout     Duration `toml:"write_timeout"`
+
+	// ReadBackTimeout bounds the ADVISORY state-cache poll that confirms an
+	// output_priority write echoed back. It is not blip-critical (the service ack
+	// is authoritative); it MUST exceed real device state-propagation latency so a
+	// slow echo is not mistaken for a failed write. Default 8s.
+	ReadBackTimeout Duration `toml:"read_back_timeout"`
+
+	// VoltageStale marks the battery-voltage reading stale (→ nominal fallback)
+	// past this age; StateStale marks the output-priority reading stale (→
+	// watchdog fail-safe) past this age.
+	VoltageStale Duration `toml:"voltage_stale"`
+	StateStale   Duration `toml:"state_stale"`
 }
 
 type Circuit struct {
@@ -351,6 +460,8 @@ func (c *Config) finalize() error {
 		c.PVModel.MinSamples = 12
 	}
 
+	c.finalizeActuator()
+
 	if c.TimeZone == "" {
 		c.TimeZone = "Asia/Tokyo"
 	}
@@ -437,6 +548,58 @@ func (c *Config) validateTelescopingGrid() error {
 		}
 	}
 	return nil
+}
+
+// finalizeActuator fills the Phase-1 actuator defaults. Entity IDs default to
+// the standard SRNE-add-on aggregate entities (the same srne_system device the
+// MQTT actuation targets); StateDir shares the PV model's persistence dir.
+func (c *Config) finalizeActuator() {
+	a := &c.ActuatorHW
+	if a.OutputPrioritySelect == "" {
+		a.OutputPrioritySelect = "select.srne_solar_system_output_priority"
+	}
+	if a.MainsChargeCurrentNumber == "" {
+		a.MainsChargeCurrentNumber = "number.srne_solar_system_mains_charge_current"
+	}
+	if a.BatteryVoltageSensor == "" {
+		a.BatteryVoltageSensor = "sensor.srne_solar_system_battery_voltage"
+	}
+	if a.UtilityOption == "" {
+		a.UtilityOption = "UTI"
+	}
+	if a.BatteryOption == "" {
+		a.BatteryOption = "SBU"
+	}
+	if a.NumUnits == 0 {
+		a.NumUnits = 2
+	}
+	if a.MaxChargeCurrentA == 0 {
+		a.MaxChargeCurrentA = 100
+	}
+	if a.MaxChargeKW == 0 {
+		a.MaxChargeKW = c.Battery.MaxChargeKW
+	}
+	if a.MaxChargeKW == 0 {
+		a.MaxChargeKW = 8 // pack acceptance fallback when Battery.MaxChargeKW unset
+	}
+	if a.StateDir == "" {
+		a.StateDir = c.PVModel.DataDir
+	}
+	if a.WatchdogInterval.Duration == 0 {
+		a.WatchdogInterval.Duration = 30 * time.Second
+	}
+	if a.WriteTimeout.Duration == 0 {
+		a.WriteTimeout.Duration = 10 * time.Second
+	}
+	if a.ReadBackTimeout.Duration == 0 {
+		a.ReadBackTimeout.Duration = 8 * time.Second
+	}
+	if a.VoltageStale.Duration == 0 {
+		a.VoltageStale.Duration = 5 * time.Minute
+	}
+	if a.StateStale.Duration == 0 {
+		a.StateStale.Duration = 5 * time.Minute
+	}
 }
 
 // resolveSecret expands an `env:VARNAME` value from the environment; plain

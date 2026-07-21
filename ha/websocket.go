@@ -38,6 +38,18 @@ type Client struct {
 
 	connected atomic.Bool
 	msgID     atomic.Int64
+
+	// pending correlates command IDs to callers awaiting a `result` frame, so a
+	// service call can be confirmed (or fail on a drop). The read loop routes
+	// results here; a lost connection fails all outstanding calls.
+	pendingMu sync.Mutex
+	pending   map[int64]chan callResult
+}
+
+// callResult is a Home Assistant `result` frame outcome for a correlated write.
+type callResult struct {
+	success bool
+	errMsg  string
 }
 
 // EntityState holds the latest known state of an HA entity.
@@ -53,6 +65,7 @@ func New(cfg config.HomeAssistant) *Client {
 		token:      cfg.Token,
 		states:     make(map[string]EntityState),
 		lastUpdate: make(map[string]time.Time),
+		pending:    make(map[int64]chan callResult),
 	}
 }
 
@@ -199,6 +212,7 @@ func (c *Client) supervise(ctx context.Context) {
 			return
 		}
 		c.connected.Store(false)
+		c.failPending(errors.New("ha: connection lost"))
 		slog.Warn("ha: connection lost, reconnecting", "error", err)
 
 		backoff := time.Second
@@ -253,7 +267,12 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 		}
 
 		var env struct {
-			Type  string `json:"type"`
+			Type    string `json:"type"`
+			ID      int64  `json:"id"`
+			Success *bool  `json:"success"`
+			Error   *struct {
+				Message string `json:"message"`
+			} `json:"error"`
 			Event *struct {
 				Data struct {
 					EntityID string `json:"entity_id"`
@@ -264,7 +283,14 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 				} `json:"data"`
 			} `json:"event"`
 		}
-		if err := json.Unmarshal(raw, &env); err != nil || env.Event == nil {
+		if err := json.Unmarshal(raw, &env); err != nil {
+			continue
+		}
+		if env.Type == "result" {
+			c.deliverResult(env.ID, env.Success, env.Error)
+			continue
+		}
+		if env.Event == nil {
 			continue
 		}
 		if ns := env.Event.Data.NewState; ns != nil {
@@ -312,6 +338,14 @@ func (c *Client) StateFloat(entityID string) float64 {
 	return v
 }
 
+// Attributes returns the latest known attribute map for an entity (nil if
+// unseen). The returned map must not be mutated by the caller.
+func (c *Client) Attributes(entityID string) map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.states[entityID].Attributes
+}
+
 // Connected reports whether the live-state feed is currently up.
 func (c *Client) Connected() bool { return c.connected.Load() }
 
@@ -340,6 +374,97 @@ func (c *Client) CallService(ctx context.Context, domain, service string, data m
 		"service":      service,
 		"service_data": data,
 	})
+}
+
+// CallServiceAck invokes a service and waits for Home Assistant's correlated
+// `result` frame, returning an error if the call failed, the context expired, or
+// the connection dropped before acknowledgement. This lets a caller (the
+// actuator) confirm an inverter write was accepted rather than fire-and-forget.
+func (c *Client) CallServiceAck(ctx context.Context, domain, service string, data map[string]any) error {
+	id := c.nextID()
+	ch := make(chan callResult, 1)
+
+	c.pendingMu.Lock()
+	c.pending[id] = ch
+	c.pendingMu.Unlock()
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+
+	if err := c.writeJSON(ctx, map[string]any{
+		"id":           id,
+		"type":         "call_service",
+		"domain":       domain,
+		"service":      service,
+		"service_data": data,
+	}); err != nil {
+		return err
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case r := <-ch:
+		if !r.success {
+			return fmt.Errorf("ha call_service %s.%s failed: %s", domain, service, r.errMsg)
+		}
+		return nil
+	}
+}
+
+// deliverResult routes a `result` frame to the caller waiting on its ID (if any).
+func (c *Client) deliverResult(id int64, success *bool, e *struct {
+	Message string `json:"message"`
+}) {
+	c.pendingMu.Lock()
+	ch, ok := c.pending[id]
+	c.pendingMu.Unlock()
+	if !ok {
+		return // subscribe/get_states acks and other uncorrelated results
+	}
+	res := callResult{success: success == nil || *success}
+	if e != nil {
+		res.errMsg = e.Message
+	}
+	select {
+	case ch <- res:
+	default:
+	}
+}
+
+// failPending fails every outstanding correlated call — invoked on a connection
+// drop so an in-flight inverter write returns promptly instead of blocking to its
+// context deadline.
+func (c *Client) failPending(err error) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	for id, ch := range c.pending {
+		select {
+		case ch <- callResult{success: false, errMsg: err.Error()}:
+		default:
+		}
+		delete(c.pending, id)
+	}
+}
+
+// LastUpdate returns the last time the given entity's state refreshed, or the
+// zero time if it has never been seen.
+func (c *Client) LastUpdate(entityID string) time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastUpdate[entityID]
+}
+
+// Fresh reports whether the entity has a known, recently-updated state — the
+// feed is up, the entity has been seen, and it refreshed within the window.
+func (c *Client) Fresh(entityID string, within time.Duration) bool {
+	if !c.connected.Load() {
+		return false
+	}
+	t := c.LastUpdate(entityID)
+	return !t.IsZero() && time.Since(t) <= within
 }
 
 // Close closes the connection. Shutdown requires cancelling the context passed

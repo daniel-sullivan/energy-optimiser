@@ -1,7 +1,7 @@
 name: Energy Optimiser
 description: Forecast-driven off-peak battery charge optimiser for solar + battery systems
 slug: energy-optimiser
-version: 0.2.0
+version: 0.2.1
 url: https://github.com/daniel-sullivan/energy-optimiser
 arch:
   - amd64
@@ -22,6 +22,7 @@ map:
 options:
   time_zone: "UTC"
   observe: true
+  mode: "observe"
   service:
     poll_interval: 300
     planning_horizon: 345600
@@ -90,6 +91,7 @@ options:
 schema:
   time_zone: str
   observe: bool?
+  mode: "list(observe|watchdog|live)?"
   service:
     poll_interval: "int(10,3600)"
     planning_horizon: "int(3600,604800)"

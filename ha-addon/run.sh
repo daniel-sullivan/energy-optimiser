@@ -12,6 +12,7 @@ CONFIG="/data/config.toml"
 
 TIME_ZONE=$(bashio::config 'time_zone')
 OBSERVE=$(bashio::config 'observe')
+MODE=$(bashio::config 'mode')
 INGRESS_PORT=$(bashio::addon.ingress_port)
 
 POLL_INTERVAL=$(bashio::config 'service.poll_interval')
@@ -23,6 +24,7 @@ FAR_SLOT_DURATION=$(bashio::config 'service.far_slot_duration')
 cat > "${CONFIG}" <<EOF
 time_zone = "${TIME_ZONE}"
 observe = ${OBSERVE}
+mode = "${MODE}"
 
 [service]
 poll_interval = "${POLL_INTERVAL}s"
