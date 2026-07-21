@@ -58,6 +58,10 @@ type fakeHA struct {
 	dropFirstAmps bool
 	sawFirstAmps  bool
 
+	// dropAmps models a persistently-undeliverable amps write: EVERY set_value is
+	// acked but NEVER reflected, so the read-back never confirms (Fix 3 give-up).
+	dropAmps bool
+
 	// panicNextCall makes the next CallServiceAck panic once (then clears),
 	// modelling a fault reaching the HA client mid-transition (H3 recovery).
 	panicNextCall bool
@@ -112,9 +116,12 @@ func (f *fakeHA) CallServiceAck(_ context.Context, domain, service string, data 
 			f.states[c.entity] = c.option
 		}
 	case "set_value":
-		if f.dropFirstAmps && !f.sawFirstAmps {
+		switch {
+		case f.dropAmps:
+			// Never reflected: read-back never confirms.
+		case f.dropFirstAmps && !f.sawFirstAmps:
 			f.sawFirstAmps = true // dropped: acked but not reflected
-		} else {
+		default:
 			f.states[c.entity] = strconv.FormatFloat(c.value, 'f', -1, 64)
 		}
 	}
@@ -299,6 +306,14 @@ var (
 // clock. initialPriority seeds the inverter state seen by startup reconcile.
 func newActuator(t *testing.T, mode Mode, now time.Time, initialPriority string) (*Actuator, *fakeHA, *fakeClock) {
 	t.Helper()
+	return newActuatorTuned(t, mode, now, initialPriority, nil)
+}
+
+// newActuatorTuned is newActuator with a pre-Start hook to adjust loop-owned
+// knobs (e.g. settleTimeout) BEFORE the loop goroutine starts, so the mutation
+// never races the loop.
+func newActuatorTuned(t *testing.T, mode Mode, now time.Time, initialPriority string, tune func(*Actuator)) (*Actuator, *fakeHA, *fakeClock) {
+	t.Helper()
 	fake := newFakeHA()
 	if initialPriority != "" {
 		fake.setState(prioEntity, initialPriority)
@@ -310,6 +325,9 @@ func newActuator(t *testing.T, mode Mode, now time.Time, initialPriority string)
 	}
 	a.now = clock.now
 	fastSettle(a)
+	if tune != nil {
+		tune(a)
+	}
 	if err := a.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -323,6 +341,21 @@ func fastSettle(a *Actuator) {
 	a.settleTimeout = 200 * time.Millisecond
 	a.settleDelay = time.Millisecond
 	a.settlePoll = 5 * time.Millisecond
+}
+
+// waitAmpsSettled blocks until the async enter amps delivery has finished (or a
+// timeout). pendingActive is an atomic mirror of the loop-owned pending state, so
+// observing it false establishes a happens-before with the loop's final ep.amps
+// write — the test may then read a.ep / fake state race-free.
+func waitAmpsSettled(t *testing.T, a *Actuator) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for a.pendingActive.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("enter amps delivery did not settle within 2s")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func mustPlan(t *testing.T, a *Actuator, plan ChargePlan) {
@@ -796,6 +829,7 @@ func TestPersistAtomicAndCorruptColdStart(t *testing.T) {
 	// (b) Enter (persists), then assert no leftover temp files and a valid file.
 	win, _ := a.rates.ActiveWindow(inWindow)
 	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	waitAmpsSettled(t, a)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -889,6 +923,7 @@ func TestEnterWaitsForUTIAppliedBeforeAmps(t *testing.T) {
 	fake.mu.Unlock()
 
 	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	waitAmpsSettled(t, a)
 
 	if got := fake.selectCalls(prioEntity); got != 1 {
 		t.Fatalf("enter must be exactly one output_priority blip, got %d", got)
@@ -916,6 +951,7 @@ func TestDroppedAmpsRetriedAndLands(t *testing.T) {
 	fake.mu.Unlock()
 
 	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	waitAmpsSettled(t, a)
 
 	if v := fake.StateFloat(ampsEntity); v <= 0 {
 		t.Fatalf("dropped amps write must be retried and land nonzero, got %v", v)
@@ -942,6 +978,7 @@ func TestSettleTimeoutStillSendsAmpsNoExtraBlip(t *testing.T) {
 	fake.mu.Unlock()
 
 	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	waitAmpsSettled(t, a)
 
 	if got := fake.selectCalls(prioEntity); got != 1 {
 		t.Fatalf("settle timeout must not add a blip; want 1 output_priority write, got %d", got)
@@ -989,5 +1026,155 @@ func TestExitSpacedDroppedSBUCaughtByWatchdog(t *testing.T) {
 	submitSync(t, a, command{kind: cmdWatchdog})
 	if fake.lastSelect(prioEntity) != "SBU" {
 		t.Fatalf("watchdog must re-safe a dropped SBU exit; last=%q", fake.lastSelect(prioEntity))
+	}
+}
+
+// --- H4: enter's amps delivery must NOT block the loop's safing latency ---
+
+// longSettle holds an enter's amps delivery in phaseSettle for the whole test by
+// making the settle timeout long, so a safing command that arrives mid-enter can
+// be proven to preempt it (rather than wait it out). Set pre-Start (no race).
+func longSettle(a *Actuator) { a.settleTimeout = 5 * time.Second }
+
+// TestBoundarySafePreemptsPendingAmps proves a boundary exit arriving while the
+// enter's amps delivery is pending runs PROMPTLY — bounded well under the settle
+// window — instead of the pre-fix ~48-78s where the enter monopolised the loop.
+func TestBoundarySafePreemptsPendingAmps(t *testing.T) {
+	a, fake, _ := newActuatorTuned(t, ModeLive, inWindow, "SBU", longSettle)
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	// The UTI echo won't arrive during the test, so the amps delivery stays parked
+	// in phaseSettle (worst case for latency-to-safe).
+	fake.mu.Lock()
+	fake.selectEchoDelay = 5 * time.Second
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	if !a.pendingActive.Load() {
+		t.Fatal("precondition: enter amps delivery must be pending")
+	}
+
+	start := time.Now()
+	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID})
+	elapsed := time.Since(start)
+
+	// Must be far below the 5s settle window (the loop-blocking bound is one
+	// in-flight write, not the settle wait). Generous ceiling for slow CI.
+	if elapsed > 2*time.Second {
+		t.Fatalf("boundary safe delayed by pending settle window: %v (settleTimeout=%v)", elapsed, a.settleTimeout)
+	}
+	if got := fake.selectCalls(prioEntity); got != 2 {
+		t.Fatalf("enter+boundary exit must be exactly 2 blips, got %d", got)
+	}
+	if last := fake.lastSelect(prioEntity); last != "SBU" {
+		t.Fatalf("boundary must drive SBU, got %q", last)
+	}
+	if a.pendingActive.Load() {
+		t.Fatal("exit must cancel the pending amps delivery")
+	}
+}
+
+// TestWatchdogSafePreemptsPendingAmps is the watchdog analogue: a stale feed
+// outside the window while the enter's amps delivery is pending must fail-safe
+// promptly, not wait out the settle window.
+func TestWatchdogSafePreemptsPendingAmps(t *testing.T) {
+	a, fake, clock := newActuatorTuned(t, ModeLive, inWindow, "SBU", longSettle)
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	fake.mu.Lock()
+	fake.selectEchoDelay = 5 * time.Second // hold pending in phaseSettle
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	if !a.pendingActive.Load() {
+		t.Fatal("precondition: enter amps delivery must be pending")
+	}
+
+	// Outside every window with a stale/unknown feed → watchdog fail-safe.
+	clock.set(outWindow)
+	fake.mu.Lock()
+	fake.fresh[prioEntity] = false
+	fake.states[prioEntity] = "unknown"
+	fake.mu.Unlock()
+
+	start := time.Now()
+	submitSync(t, a, command{kind: cmdWatchdog})
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("watchdog safe delayed by pending settle window: %v", elapsed)
+	}
+	if fake.lastSelect(prioEntity) != "SBU" {
+		t.Fatalf("watchdog must fail-safe to SBU while amps pending; last=%q", fake.lastSelect(prioEntity))
+	}
+	if a.pendingActive.Load() {
+		t.Fatal("watchdog safe must cancel the pending amps delivery")
+	}
+}
+
+// TestShutdownDuringPendingAmpsSafes proves shutdown while the enter's amps
+// delivery is still pending ALWAYS drives SBU (the deterministic loop backstop),
+// never skips the fail-safe, and does not wait out the settle window.
+func TestShutdownDuringPendingAmpsSafes(t *testing.T) {
+	a, fake, _ := newActuatorTuned(t, ModeLive, inWindow, "SBU", longSettle)
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	fake.mu.Lock()
+	fake.selectEchoDelay = 5 * time.Second // hold pending in phaseSettle
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	if !a.pendingActive.Load() {
+		t.Fatal("precondition: enter amps delivery must be pending at shutdown")
+	}
+
+	start := time.Now()
+	a.Close()
+	elapsed := time.Since(start)
+
+	if fake.lastSelect(prioEntity) != "SBU" {
+		t.Fatalf("shutdown during pending amps must drive SBU; last=%q", fake.lastSelect(prioEntity))
+	}
+	if got := fake.selectCalls(prioEntity); got != 2 { // enter UTI + shutdown SBU
+		t.Fatalf("want exactly 2 blips (enter + shutdown safe), got %d", got)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("shutdown must not wait out the settle window: %v", elapsed)
+	}
+}
+
+// --- Fix 3: unconfirmed amps must not set ep.amps (avoid believing we charge) ---
+
+// TestUndeliverableAmpsStaysConfirmedAndResends proves that when an amps write is
+// never confirmed (write+retry both fail read-back), ep.amps is LEFT at the last
+// confirmed value (0), so the next tick's doAdjust RE-SENDS (a non-blip write)
+// rather than epsilon-suppressing a charge that never landed.
+func TestUndeliverableAmpsStaysConfirmedAndResends(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
+	win, _ := a.rates.ActiveWindow(inWindow)
+
+	fake.mu.Lock()
+	fake.dropAmps = true // every amps write acked but never reflected
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter
+	waitAmpsSettled(t, a)                                              // write + retry, then give up
+
+	if a.ep.amps != 0 {
+		t.Fatalf("undeliverable amps must leave ep.amps at last confirmed (0), got %v", a.ep.amps)
+	}
+	writesAfterEnter := fake.ampsWriteCount(ampsEntity)
+	if writesAfterEnter < 2 {
+		t.Fatalf("undeliverable amps must be attempted + retried (>=2 writes), got %d", writesAfterEnter)
+	}
+
+	// Next tick, same window, still charging (in bypass): ep.amps==0 vs a nonzero
+	// target is NOT epsilon-suppressed → doAdjust re-sends.
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
+	if got := fake.ampsWriteCount(ampsEntity); got <= writesAfterEnter {
+		t.Fatalf("next tick must re-send amps (ep.amps stayed unconfirmed); writes %d→%d", writesAfterEnter, got)
+	}
+	if got := fake.selectCalls(prioEntity); got != 1 {
+		t.Fatalf("re-sends are non-blip; want exactly 1 output_priority blip, got %d", got)
 	}
 }

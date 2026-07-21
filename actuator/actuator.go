@@ -96,9 +96,8 @@ type Actuator struct {
 	closed chan struct{}
 	wg     sync.WaitGroup
 
-	startOnce   sync.Once
-	closeOnce   sync.Once
-	startedFlag atomic.Bool
+	startOnce sync.Once
+	closeOnce sync.Once
 
 	// now is the clock, injectable in tests.
 	now func() time.Time
@@ -112,6 +111,45 @@ type Actuator struct {
 	// Goroutine-owned (loop only):
 	ep            episode
 	boundaryTimer *time.Timer
+	// pending is the in-flight, NON-BLOCKING amps delivery following an enter (H4
+	// fix). The enter-blip is spent synchronously on the loop; the UTI-settle wait
+	// and amps write/retry are then driven incrementally by servicePending between
+	// commands, so cmdWatchdog/cmdBoundary/cmdSafe preempt promptly. Loop-owned.
+	pending *pendingEnter
+	// duringShutdown makes pause/pollState use non-abortable (full-spacing) waits
+	// for the final fail-safe, so the shutdown SBU write is never dropped by the
+	// controller's "space writes" rule. Set only on the loop's shutdown path.
+	duringShutdown bool
+
+	// pendingActive mirrors (pending != nil) for race-free observation from other
+	// goroutines (tests await amps-delivery completion). Written only by the loop.
+	pendingActive atomic.Bool
+}
+
+// enterPhase tracks the non-blocking amps-delivery follow-up to an enter.
+type enterPhase int
+
+const (
+	// phaseSettle: waiting for output_priority→UTI to APPLY (echo in the state
+	// feed) or the advisory settle deadline to elapse, before the amps write.
+	phaseSettle enterPhase = iota
+	// phaseSpace: honouring the write-spacing delay before issuing the amps write.
+	phaseSpace
+	// phaseConfirm: amps write issued; polling the read-back until it lands (or a
+	// deadline, which triggers one spaced retry then give-up).
+	phaseConfirm
+)
+
+// pendingEnter is the loop-owned state for the async amps delivery after an
+// enter-blip. It carries only wall-clock deadlines and phase; every field is
+// touched exclusively by the loop goroutine (via servicePending).
+type pendingEnter struct {
+	amps     float64
+	phase    enterPhase
+	settleAt time.Time // phaseSettle: proceed to the amps write once reached
+	writeAt  time.Time // phaseSpace: earliest time to issue the amps write
+	landAt   time.Time // phaseConfirm: retry/give-up deadline for the read-back
+	retried  bool
 }
 
 type cmdKind int
@@ -174,7 +212,6 @@ func (a *Actuator) Start(ctx context.Context) error {
 		// stays single-threaded. Any boundary timer it arms enqueues onto the
 		// buffered command channel and is drained once the loop is up.
 		startErr = a.reconcile(ctx)
-		a.startedFlag.Store(true)
 		a.wg.Add(2)
 		go a.loop()
 		go a.watchdogTicker(ctx)
@@ -191,15 +228,15 @@ func (a *Actuator) SetChargePlan(ctx context.Context, plan ChargePlan) error {
 
 // Close force-safes the inverter (battery-priority + zero grid charge, if bypass
 // is suspected) then stops all goroutines. Idempotent.
+//
+// The shutdown fail-safe is run DETERMINISTICALLY by the loop itself (see
+// shutdownSafe), not submitted as a racing cmdSafe: closing a.closed makes the
+// loop cancel any pending amps, drive SBU, then exit. This removes the old
+// select-race where a.closed could be picked over a still-queued cmdSafe and skip
+// safing, and needs no write-timeout budget tuning. If Start was never called the
+// loop does not exist and there is nothing to safe.
 func (a *Actuator) Close() {
 	a.closeOnce.Do(func() {
-		if a.startedFlag.Load() {
-			ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WriteTimeout.Duration+time.Second)
-			if err := a.submit(ctx, command{kind: cmdSafe, reason: "shutdown"}); err != nil {
-				slog.Warn("actuator: shutdown safe failed", "error", err)
-			}
-			cancel()
-		}
 		close(a.closed)
 		a.wg.Wait()
 		a.stopBoundaryTimer()
@@ -236,19 +273,151 @@ func (a *Actuator) submitAsync(c command) {
 }
 
 // loop is the sole owner of episode state and inverter writes.
+//
+// Worst-case latency-to-safe: a cmdWatchdog/cmdBoundary/cmdSafe arriving while an
+// enter's amps delivery is pending waits at most for one in-flight inverter write
+// ack — bounded by WriteTimeout (default 10s) — never the full enter settle
+// window (~48–78s pre-fix). servicePending performs at most ONE writeAmps per
+// tick and only sub-millisecond state reads otherwise, so the loop is never
+// blocked longer than a single write's ack before it can service a safing
+// command. Typically the safe runs within one settlePoll tick (≪ WriteTimeout).
 func (a *Actuator) loop() {
 	defer a.wg.Done()
+	// timer drives servicePending. Armed to settlePoll while an amps delivery is
+	// pending, parked far in the future when idle (so an idle loop never spins).
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
 	for {
+		// Give shutdown priority: if closed is already signalled, safe and exit
+		// deterministically rather than risk the select picking another ready case.
 		select {
 		case <-a.closed:
+			a.shutdownSafe()
+			return
+		default:
+		}
+		a.armServiceTimer(timer)
+		select {
+		case <-a.closed:
+			a.shutdownSafe()
 			return
 		case c := <-a.cmds:
 			err := a.handle(c)
 			if c.done != nil {
 				c.done <- err
 			}
+		case <-timer.C:
+			a.servicePending()
 		}
 	}
+}
+
+// armServiceTimer resets the service timer to the poll cadence while an amps
+// delivery is pending, or parks it when idle. Uses the stop-drain-reset pattern
+// so it is safe regardless of whether the timer had already fired.
+func (a *Actuator) armServiceTimer(t *time.Timer) {
+	d := time.Hour
+	if a.pending != nil {
+		d = a.settlePoll
+		if d <= 0 {
+			d = 5 * time.Millisecond
+		}
+	}
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+// shutdownSafe is the deterministic fail-safe run by the loop before it exits on
+// close. It cancels any pending amps delivery and drives SBU if bypass is (or may
+// be) active. It runs with non-abortable write-spacing (duringShutdown) so the
+// SBU write is never dropped by the controller. Idempotent: a no-op write when
+// bypass is not suspected, and a no-op entirely in observe mode.
+func (a *Actuator) shutdownSafe() {
+	a.duringShutdown = true
+	a.cancelPending()
+	if err := a.doSafe("shutdown", false); err != nil {
+		slog.Warn("actuator: shutdown fail-safe failed", "error", err)
+	}
+}
+
+// cancelPending discards an in-flight amps delivery. Called by every transition
+// that supersedes the enter's amps target (adjust/stop) or leaves bypass
+// (exit/safe/rollover), so a late pending write can never re-charge after a stop
+// or override an explicit setpoint. Loop-only.
+func (a *Actuator) cancelPending() {
+	if a.pending != nil {
+		slog.Info("actuator: cancelling pending amps delivery", "phase", a.pending.phase)
+		a.pending = nil
+	}
+	a.pendingActive.Store(false)
+}
+
+// servicePending advances the async amps delivery by one bounded step. It reads
+// state (sub-ms) and issues at most ONE writeAmps (bounded by WriteTimeout) per
+// call, then returns so the loop can service other commands. It NEVER sleeps or
+// polls in a loop — the loop's timer supplies the cadence. Loop-only.
+func (a *Actuator) servicePending() {
+	p := a.pending
+	if p == nil {
+		return
+	}
+	// Real wall-clock: device settle/echo latency is physical, not the injectable
+	// policy clock (which tests freeze).
+	now := time.Now()
+	switch p.phase {
+	case phaseSettle:
+		// Advance once UTI has APPLIED (echoed) or the advisory settle elapsed.
+		// ADVISORY (preserves C1): a settle timeout means the echo lagged, not that
+		// the enter failed — the blip is already spent; we proceed to amps anyway.
+		if a.ha.State(a.cfg.OutputPrioritySelect) == a.cfg.UtilityOption || !now.Before(p.settleAt) {
+			p.phase = phaseSpace
+			p.writeAt = now.Add(a.settleDelay)
+		}
+	case phaseSpace:
+		if now.Before(p.writeAt) {
+			return
+		}
+		if err := a.writeAmps(p.amps); err != nil {
+			slog.Warn("actuator: pending amps write not accepted", "error", err, "retried", p.retried)
+			a.afterUnconfirmedAmps(p, now)
+			return
+		}
+		// Amps write accepted; poll the (slow) read-back until it lands.
+		p.phase = phaseConfirm
+		p.landAt = now.Add(a.settleTimeout)
+	case phaseConfirm:
+		if a.ampsConfirmed(p.amps) {
+			a.ep.amps = p.amps // CONFIRMED landed
+			a.persist()
+			a.cancelPending()
+			return
+		}
+		if now.Before(p.landAt) {
+			return
+		}
+		a.afterUnconfirmedAmps(p, now)
+	}
+}
+
+// afterUnconfirmedAmps retries the amps write once (spaced) or gives up. On
+// give-up it leaves ep.amps at the last CONFIRMED value (Fix 3) — never the
+// commanded-but-unconfirmed value — so the next tick's doAdjust re-sends (a
+// non-blip write) rather than epsilon-suppressing a charge that never landed.
+func (a *Actuator) afterUnconfirmedAmps(p *pendingEnter, now time.Time) {
+	if !p.retried {
+		p.retried = true
+		p.phase = phaseSpace
+		p.writeAt = now.Add(a.settleDelay)
+		return
+	}
+	slog.Warn("actuator: enter amps delivery unconfirmed after retry — ep.amps left at last "+
+		"confirmed value; next adjust will re-send", "commanded", round1(p.amps), "confirmed", round1(a.ep.amps))
+	a.cancelPending()
 }
 
 func (a *Actuator) handle(c command) (err error) {
@@ -312,6 +481,8 @@ func (a *Actuator) handlePlan(plan ChargePlan) error {
 				return err
 			}
 		}
+		// A new window supersedes any pending amps delivery from the prior window.
+		a.cancelPending()
 		a.setEpisode(episode{windowID: plan.Window.ID})
 	}
 
@@ -397,39 +568,32 @@ func (a *Actuator) doEnter(amps float64, win config.OffPeakOccurrence) error {
 	a.armBoundary(win)
 	a.persist()
 
-	// Space consecutive inverter writes: WAIT for the output_priority (UTI) write to
-	// actually APPLY on the inverter before issuing the amps write. The SRNE
-	// controller drops a second write issued while it is still processing the bypass
-	// transition ("space writes"), which would silently strand this first charge slot
-	// at 0 A until the next tick's doAdjust re-sends it (up to 5 min late). Poll the
-	// echoed state (generous settle timeout — the SRNE echo is slow).
+	// H4 fix: the amps delivery is a NON-BLOCKING follow-up. The SRNE controller
+	// drops a second write issued while it is still applying the bypass transition
+	// ("space writes"), so the amps write must wait for UTI to APPLY, then be
+	// spaced. Rather than block the loop goroutine polling+sleeping for up to
+	// ~48–78s (which would delay watchdog/boundary/safe by the same), we schedule
+	// the wait + amps write/retry as loop-serviced pending state (servicePending),
+	// so safing commands preempt within one in-flight write (≤ WriteTimeout).
 	//
-	// ADVISORY (preserves C1): a settle-poll timeout means the echo lagged, NOT that
-	// the write failed. It MUST NOT reverse entered/inBypass or trigger doSafe (that
-	// is the exact C1 bug — an extra blip). On timeout we still issue the amps write
-	// and let the next tick recover.
-	if err := a.pollState(a.cfg.OutputPrioritySelect, a.cfg.UtilityOption, a.settleTimeout, a.settlePoll); err != nil {
-		slog.Warn("actuator: ENTER — output_priority did not read UTI within settle timeout "+
-			"(advisory only — blip already spent, proceeding with amps write; next tick recovers)", "error", err)
+	// ADVISORY (preserves C1): the settle wait is advisory — a timeout means the
+	// echo lagged, NOT that the enter failed. It never reverses entered/inBypass
+	// nor triggers doSafe (that would be an extra blip). On timeout servicePending
+	// still issues the amps write and the next tick recovers.
+	a.pending = &pendingEnter{
+		amps:     amps,
+		phase:    phaseSettle,
+		settleAt: time.Now().Add(a.settleTimeout),
 	}
-	// Space the amps write from the priority write regardless of how the settle poll
-	// resolved, to respect the controller's "space writes" requirement.
-	a.pause()
-
-	if err := a.writeAmpsConfirmed(amps); err != nil {
-		// In bypass but amps unconfirmed — the next tick's adjust retries. Do NOT
-		// exit (would waste the exit blip).
-		a.ep.amps = 0
-		a.persist()
-		return err
-	}
-	a.ep.amps = amps
-	a.persist()
+	a.pendingActive.Store(true)
 	return nil
 }
 
 // doAdjust changes the charge current only (no blip).
 func (a *Actuator) doAdjust(amps float64) error {
+	// An explicit adjust supersedes any in-flight enter amps delivery; cancel it so
+	// a late pending write cannot overwrite this setpoint.
+	a.cancelPending()
 	if math.Abs(amps-a.ep.amps) < adjustEpsilon {
 		return nil
 	}
@@ -444,6 +608,8 @@ func (a *Actuator) doAdjust(amps float64) error {
 
 // doStop sets the charge current to zero but stays in bypass (no blip).
 func (a *Actuator) doStop() error {
+	// Cancel a pending enter amps delivery so it cannot re-raise current after stop.
+	a.cancelPending()
 	if a.ep.amps == 0 {
 		return nil
 	}
@@ -458,6 +624,8 @@ func (a *Actuator) doStop() error {
 
 // doExit sets amps to zero then exits bypass to battery-priority (one blip).
 func (a *Actuator) doExit(reason string) error {
+	// Leaving bypass supersedes any in-flight enter amps delivery.
+	a.cancelPending()
 	slog.Info("actuator: EXIT bypass (blip)", "reason", reason, "window", a.ep.windowID)
 	var errs []error
 	if err := a.writeAmps(0); err != nil {
@@ -482,6 +650,8 @@ func (a *Actuator) doExit(reason string) error {
 // otherwise it writes only when bypass is suspected (last-known UTI, our episode
 // says in-bypass, or the state is unknown/stale). No-op (log only) in observe.
 func (a *Actuator) doSafe(reason string, force bool) error {
+	// Safing supersedes any in-flight enter amps delivery.
+	a.cancelPending()
 	if !a.mode.mayWrite() {
 		slog.Info("actuator: would fail-safe (no-op in current mode)", "reason", reason, "mode", a.mode)
 		return nil
@@ -723,56 +893,36 @@ func (a *Actuator) writeAmps(amps float64) error {
 	return nil
 }
 
-// writeAmpsConfirmed sets a NONZERO mains-charge-current, then verifies the SRNE
-// echoed it back; if the controller dropped the write (read-back stays ~0 — the
-// "space writes" symptom that the live trigger test caught), it retries ONCE,
-// spaced, before relying on the next-tick doAdjust. Amps writes are non-blip, so
-// the retry carries no blip-budget cost. A zero command is not confirmed (nothing
-// to distinguish from a dropped write, and stop/exit have their own safety nets).
-func (a *Actuator) writeAmpsConfirmed(amps float64) error {
-	if err := a.writeAmps(amps); err != nil {
-		return err
-	}
-	if round1(amps) <= 0 || a.ampsLanded(amps) {
-		return nil
-	}
-	slog.Warn("actuator: mains_charge_current write appears DROPPED (read-back stayed ~0) — "+
-		"retrying once, spaced", "amps", round1(amps))
-	a.pause()
-	if err := a.writeAmps(amps); err != nil {
-		return err
-	}
-	if !a.ampsLanded(amps) {
-		slog.Warn("actuator: mains_charge_current retry still unconfirmed — next-tick adjust will re-send",
-			"amps", round1(amps))
-	}
-	return nil
-}
-
-// ampsLanded polls the mains-charge-current read-back until it reflects the
-// commanded setpoint (within adjustEpsilon), bounded by the settle timeout (the
-// SRNE echo is slow). Returns false if it never converges — i.e. the write was
-// dropped. Bounds on REAL elapsed time so it terminates under a frozen test clock.
-func (a *Actuator) ampsLanded(want float64) bool {
+// ampsConfirmed reports whether the mains-charge-current read-back currently
+// reflects the commanded setpoint (within adjustEpsilon). It is a SINGLE,
+// non-blocking check — the enter's amps read-back is polled by the loop's service
+// tick (servicePending / phaseConfirm), never by a blocking sleep-loop on the
+// write-owning goroutine. This replaces the former ampsLanded blocking poll,
+// which monopolised the loop for up to the settle timeout.
+func (a *Actuator) ampsConfirmed(want float64) bool {
 	target := round1(want)
-	deadline := time.Now().Add(a.settleTimeout)
-	for {
-		if math.Abs(a.ha.StateFloat(a.cfg.MainsChargeCurrentNumber)-target) < adjustEpsilon {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(a.settlePoll)
-	}
+	return math.Abs(a.ha.StateFloat(a.cfg.MainsChargeCurrentNumber)-target) < adjustEpsilon
 }
 
 // pause spaces two consecutive inverter writes (the SRNE "space writes"
 // requirement). It sleeps the settle delay; the loop goroutine is the sole writer
-// so blocking it briefly is safe (async watchdog/boundary commands buffer).
+// so blocking it briefly is safe (async watchdog/boundary commands buffer). It
+// returns early on a.closed so a normal transition's spacing does not wedge
+// shutdown — EXCEPT on the loop's shutdown path (duringShutdown), where the full
+// spacing is honoured so the final SBU write is never dropped by the controller.
 func (a *Actuator) pause() {
-	if a.settleDelay > 0 {
+	if a.settleDelay <= 0 {
+		return
+	}
+	if a.duringShutdown {
 		time.Sleep(a.settleDelay)
+		return
+	}
+	t := time.NewTimer(a.settleDelay)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-a.closed:
 	}
 }
 
@@ -785,9 +935,11 @@ func (a *Actuator) verifyState(entityID, want string) error {
 // pollState polls the state cache until the entity reports want, or timeout
 // elapses. It bounds on REAL elapsed time (not the injectable clock) so it
 // terminates deterministically even under a frozen test clock — the poll tracks
-// real device state-propagation latency. Used both for the advisory exit/safe
-// read-back (short ReadBackTimeout) and the enter settle-wait (generous
-// settleTimeout, since read_back_timeout=8s is too tight for the slow SRNE echo).
+// real device state-propagation latency. It also returns promptly on a.closed so
+// an advisory read-back cannot wedge shutdown — EXCEPT on the loop's shutdown path
+// (duringShutdown), where the final safe's read-back is allowed to run to its
+// bound. Used both for the advisory exit/safe read-back (short ReadBackTimeout)
+// and (historically) the enter settle-wait.
 func (a *Actuator) pollState(entityID, want string, timeout, poll time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -797,7 +949,17 @@ func (a *Actuator) pollState(entityID, want string, timeout, poll time.Duration)
 		if time.Now().After(deadline) {
 			return fmt.Errorf("read-back %s: want %q, have %q", entityID, want, a.ha.State(entityID))
 		}
-		time.Sleep(poll)
+		if a.duringShutdown {
+			time.Sleep(poll)
+			continue
+		}
+		t := time.NewTimer(poll)
+		select {
+		case <-t.C:
+		case <-a.closed:
+			t.Stop()
+			return fmt.Errorf("read-back %s aborted: actuator closing (advisory)", entityID)
+		}
 	}
 }
 
