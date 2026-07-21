@@ -27,6 +27,7 @@ type DashboardView struct {
 	Ribbon         Ribbon
 	Forecast       Forecast
 	Events         []EventVM
+	Accuracy       AccuracyView
 }
 
 // Decision is the current action the optimiser is taking, in the operator's
@@ -162,6 +163,7 @@ func (s *Server) buildView() *DashboardView {
 	v.Ribbon = s.buildRibbon(now, sched)
 	v.Forecast = s.buildForecast(sched)
 	v.Events = s.buildEvents(now, sched)
+	v.Accuracy = s.buildAccuracy(s.provider.Accuracy())
 	return v
 }
 

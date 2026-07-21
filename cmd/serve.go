@@ -36,12 +36,12 @@ func runServe(_ *cobra.Command, _ []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	mode := "live"
+	runMode := "live"
 	if dryRun {
-		mode = "dry-run"
+		runMode = "dry-run"
 	}
 	slog.Info("starting energy optimiser",
-		"mode", mode,
+		"run_mode", runMode,
 		"web_port", cfg.Service.WebPort,
 		"poll_interval", cfg.Service.PollInterval,
 		"planning_horizon", cfg.Service.PlanningHorizon,

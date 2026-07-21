@@ -49,6 +49,7 @@ type Hub struct {
 	notifier    *alert.Notifier
 	decisionPub *serve.DecisionPublisher
 	server      *serve.Server
+	accuracy    *accuracyRecorder
 	dryRun      bool
 	mode        actuator.Mode
 
@@ -67,6 +68,11 @@ type Hub struct {
 	// must not launch while the previous is still running.
 	refreshMu      sync.Mutex
 	refreshRunning bool
+
+	// accResolveMu single-flights the background accuracy actual-resolution so a
+	// slow metrics lookup never overlaps itself across ticks.
+	accResolveMu      sync.Mutex
+	accResolveRunning bool
 }
 
 func New(cfg *config.Config, dryRun bool) (*Hub, error) {
@@ -129,6 +135,21 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		return nil, fmt.Errorf("decision publisher: %w", err)
 	}
 	h.decisionPub = decisionPub
+
+	// Forecast-accuracy recorder — observe-safe: reads the metrics store (PV/grid
+	// actuals) and the HA state cache (SoC), writes only its own rolling-window
+	// JSON under DataDir. History accrues from deploy; nothing is backfilled.
+	var accActuals actualsSource
+	if h.influx != nil {
+		accActuals = influxActuals{client: h.influx}
+	}
+	h.accuracy = newAccuracyRecorder(
+		cfg.PVModel.DataDir,
+		cfg.Service.SlotDuration.Duration,
+		accActuals,
+		cfg.HomeAssistant.Entities.PVPower,
+		cfg.HomeAssistant.Entities.GridPower,
+	)
 
 	h.server = serve.New(h, cfg)
 	return h, nil
@@ -279,6 +300,7 @@ func (h *Hub) tick(ctx context.Context) {
 
 	h.recordDecision(ctx, now, slot)
 	h.publishDecision(now, slot, sched, currentSOC)
+	h.recordAccuracy(ctx, now, slot, currentSOC, socKnown)
 
 	var flowKW, importKW float64
 	if slot != nil {
@@ -500,6 +522,72 @@ func (h *Hub) recordDecision(ctx context.Context, now time.Time, slot *optimizer
 	}})
 }
 
+// recordAccuracy captures this slot's predictions (Solcast + learned model for
+// solar, planned SoC + planned net grid from the current schedule slot) and the
+// live measured SoC, then kicks off background resolution of the PV/grid actuals
+// from the metrics store. Observe-safe: read-only inputs, writes only its own
+// rolling-window store.
+func (h *Hub) recordAccuracy(ctx context.Context, now time.Time, slot *optimizer.Slot, currentSOC float64, socKnown bool) {
+	solcastKW, hasSolcast, modelKW, hasModel := h.solarPredictionFor(now)
+	in := accuracyTick{
+		Now:        now,
+		SolcastKW:  solcastKW,
+		HasSolcast: hasSolcast,
+		ModelKW:    modelKW,
+		HasModel:   hasModel,
+	}
+	if socKnown {
+		in.MeasuredSOC = currentSOC
+	}
+	if slot != nil {
+		in.HasPlan = true
+		in.PlannedSOC = slot.SOC
+		in.PlannedGrid = slot.GridImportKW - slot.GridExportKW
+	}
+	h.accuracy.Record(in)
+	h.startResolveAccuracy(ctx, now)
+}
+
+// solarPredictionFor returns the raw Solcast and learned-model solar predictions
+// (kW) for the slot starting at slotStart — the same face-value model prediction
+// logSolarResidual measures (no lead-time haircut), so the panel shows calibration
+// accuracy, not the applied fill.
+func (h *Hub) solarPredictionFor(slotStart time.Time) (solcastKW float64, hasSolcast bool, modelKW float64, hasModel bool) {
+	slotEnd := slotStart.Add(h.cfg.Service.SlotDuration.Duration)
+	solcastKW, hasSolcast = averageSolcast(h.solcast.Cached(), slotStart, slotEnd)
+	if h.pvModel != nil && h.weather != nil {
+		if w := h.weather.Cached(); w != nil {
+			if gti := interpolateGTI(w.Points, slotStart); len(gti) > 0 {
+				modelKW = h.pvModel.PredictKW(slotStart, gti)
+				hasModel = true
+			}
+		}
+	}
+	return solcastKW, hasSolcast, modelKW, hasModel
+}
+
+// startResolveAccuracy runs the recorder's metrics-backed actual resolution on a
+// background goroutine, single-flighted so a slow lookup never overlaps itself or
+// stalls the tick.
+func (h *Hub) startResolveAccuracy(ctx context.Context, now time.Time) {
+	h.accResolveMu.Lock()
+	if h.accResolveRunning {
+		h.accResolveMu.Unlock()
+		return
+	}
+	h.accResolveRunning = true
+	h.accResolveMu.Unlock()
+
+	go func() {
+		defer func() {
+			h.accResolveMu.Lock()
+			h.accResolveRunning = false
+			h.accResolveMu.Unlock()
+		}()
+		h.accuracy.ResolveActuals(ctx, now)
+	}()
+}
+
 // publishDecision pushes the current schedule's decision (grid-charge plan,
 // planned flows, objective, a human-readable rationale) plus derived
 // charge/discharge time-remaining to MQTT as HA-discovery entity state.
@@ -541,6 +629,9 @@ func (h *Hub) Schedule() *optimizer.Schedule {
 }
 
 func (h *Hub) LoadConfidence() float64 { return h.loadModel.Confidence() }
+
+// Accuracy returns the rolling predicted-vs-actual window for the dashboard panel.
+func (h *Hub) Accuracy() serve.AccuracySnapshot { return h.accuracy.Snapshot() }
 
 // LastTick returns the wall-clock time the most recent tick completed.
 func (h *Hub) LastTick() time.Time {

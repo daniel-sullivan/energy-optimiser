@@ -35,6 +35,7 @@ type StateProvider interface {
 	LoadConfidence() float64
 	LastTick() time.Time
 	DataStale() bool
+	Accuracy() AccuracySnapshot
 	Subscribe() *Subscriber
 	Unsubscribe(sub *Subscriber)
 }
@@ -179,7 +180,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 // plan (ribbon, forecast, events) may have changed.
 func (s *Server) emitFull(w http.ResponseWriter, flusher http.Flusher) {
 	v := s.buildView()
-	for _, name := range []string{"meta", "decision", "tiles", "gauges", "ribbon", "forecast", "events"} {
+	for _, name := range []string{"meta", "decision", "tiles", "gauges", "ribbon", "forecast", "events", "accuracy"} {
 		s.writePartial(w, name, v)
 	}
 	flusher.Flush()
