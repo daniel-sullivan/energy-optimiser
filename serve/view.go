@@ -373,8 +373,8 @@ func (s *Server) buildRibbon(now time.Time, sched *optimizer.Schedule) Ribbon {
 		r.OffPeak = append(r.OffPeak, RibbonRect{X: float64(offStart), W: float64(n - offStart)})
 	}
 
-	horizon := time.Duration(n) * s.slotDur
-	if el := now.Sub(sched.Slots[0].Start); el >= 0 && el <= horizon {
+	horizon := sched.Slots[n-1].End.Sub(sched.Slots[0].Start)
+	if el := now.Sub(sched.Slots[0].Start); el >= 0 && horizon > 0 && el <= horizon {
 		r.NowFrac = float64(el) / float64(horizon)
 		r.NowShown = true
 	}
@@ -412,10 +412,9 @@ func (s *Server) buildForecast(sched *optimizer.Schedule) Forecast {
 	var peak float64
 	var peakIdx int
 	var totalKWh float64
-	hoursPerSlot := s.slotDur.Hours()
 	for i := range sched.Slots {
 		sk := sched.Slots[i].SolarKW
-		totalKWh += sk * hoursPerSlot
+		totalKWh += sk * sched.Slots[i].DurationH // variable slot width (telescoping grid)
 		if sk > peak {
 			peak, peakIdx = sk, i
 		}
@@ -442,7 +441,8 @@ func (s *Server) buildForecast(sched *optimizer.Schedule) Forecast {
 	f.Area = area.String()
 	f.Peak = fmt.Sprintf("peak %.1f kW", peak)
 	f.PeakWhen = sched.Slots[peakIdx].Start.In(s.loc).Format("Mon 15:04")
-	f.TotalKWh = fmt.Sprintf("%.0f kWh planned over 72 h", totalKWh)
+	horizonH := sched.Slots[n-1].End.Sub(sched.Slots[0].Start).Hours()
+	f.TotalKWh = fmt.Sprintf("%.0f kWh planned over %.0f h", totalKWh, horizonH)
 	return f
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"energy-optimiser/config"
+	"energy-optimiser/hub"
 	"energy-optimiser/influx"
 	"energy-optimiser/optimizer"
 )
@@ -91,9 +92,9 @@ var backtestCmd = &cobra.Command{
 			grid[i] = start.Add(time.Duration(i) * slotDur)
 		}
 
-		loadW := resampleSlots(loadS, grid, slotDur, 1.0, 0, 25000)        // W
-		pvKW := resampleSlots(pvS, grid, slotDur, 1.0/1000.0, 0, 25000)    // kW
-		socFrac := resampleSlots(socS, grid, slotDur, 1.0/100.0, 0, 100)   // fraction; SoC band-filter
+		loadW := resampleSlots(loadS, grid, slotDur, 1.0, 0, 25000)      // W
+		pvKW := resampleSlots(pvS, grid, slotDur, 1.0/1000.0, 0, 25000)  // kW
+		socFrac := resampleSlots(socS, grid, slotDur, 1.0/100.0, 0, 100) // fraction; SoC band-filter
 
 		nTicks := nSlots - horizonSlots
 		if nTicks <= 0 {
@@ -126,7 +127,14 @@ var backtestCmd = &cobra.Command{
 
 		for i := range nTicks {
 			t0 := grid[i]
-			in := optimizer.PrepareInput(t0, cfg, pvKW[i:i+horizonSlots], loadW[i:i+horizonSlots], simSoC)
+			// Telescope the uniform actuals window onto this tick's production grid
+			// (BuildGrid): fine near slots take one uniform slot, coarse far slots
+			// average the uniform slots they span (mean power). This mirrors the
+			// shipped hub path so the backtest exercises the same code.
+			tg := optimizer.BuildGrid(t0, cfg)
+			pvSlot := backtestSolarFill(tg, t0, telescopeUniform(pvKW[i:], tg, slotMins))
+			loadSlot := telescopeUniform(loadW[i:], tg, slotMins)
+			in := optimizer.PrepareInput(t0, cfg, pvSlot, loadSlot, simSoC)
 			sched, err := optimizer.Solve(in)
 			if err != nil {
 				return fmt.Errorf("solve @ %s: %w", t0.Format(time.RFC3339), err)
@@ -270,6 +278,55 @@ func resampleSlots(samples []influx.Sample, grid []time.Time, slotDur time.Durat
 			out[i] = last
 		default:
 			out[i] = 0
+		}
+	}
+	return out
+}
+
+// backtestSolarFill routes the telescoped measured-PV actuals through the SAME
+// hub.BlendSolar path production uses, so the offline replay exercises the shipped
+// fill. The backtest has perfect foresight — actuals cover the whole horizon — so
+// coverage extends to the grid end and no learned model/weather is supplied: the
+// learned far-fill and crossfade stay dormant and the actuals pass through
+// unchanged. (Production instead feeds Solcast as the near-term source and the
+// learned PV model × GTI beyond its ~72h coverage.)
+func backtestSolarFill(g optimizer.Grid, now time.Time, pvNear []float64) []float64 {
+	if g.Len() == 0 {
+		return pvNear
+	}
+	hasNear := make([]bool, len(pvNear))
+	for i := range hasNear {
+		hasNear[i] = true
+	}
+	coverageEnd := g.End(g.Len() - 1)
+	return hub.BlendSolar(g, now, pvNear, hasNear, coverageEnd, nil, nil)
+}
+
+// telescopeUniform maps a uniform-slot power window (slotMins-wide mean-power
+// samples) onto a telescoping grid: each grid slot averages the
+// round(width/slotMins) uniform slots it spans (mean power, matching the hub's
+// Solcast averaging). Grid slot boundaries always align to the uniform grid, so
+// the per-slot counts are exact; a window exhausted at the tail contributes
+// nothing to the trailing slots.
+func telescopeUniform(uniform []float64, g optimizer.Grid, slotMins int) []float64 {
+	out := make([]float64, g.Len())
+	u := 0
+	for k := range out {
+		n := int(math.Round(g.Hours[k] * 60 / float64(slotMins)))
+		if n < 1 {
+			n = 1
+		}
+		var sum float64
+		var c int
+		for j := 0; j < n; j++ {
+			if u < len(uniform) {
+				sum += uniform[u]
+				c++
+			}
+			u++
+		}
+		if c > 0 {
+			out[k] = sum / float64(c)
 		}
 	}
 	return out

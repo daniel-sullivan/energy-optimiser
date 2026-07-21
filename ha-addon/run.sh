@@ -16,7 +16,9 @@ INGRESS_PORT=$(bashio::addon.ingress_port)
 
 POLL_INTERVAL=$(bashio::config 'service.poll_interval')
 PLANNING_HORIZON=$(bashio::config 'service.planning_horizon')
+NEAR_HORIZON=$(bashio::config 'service.near_horizon')
 SLOT_DURATION=$(bashio::config 'service.slot_duration')
+FAR_SLOT_DURATION=$(bashio::config 'service.far_slot_duration')
 
 cat > "${CONFIG}" <<EOF
 time_zone = "${TIME_ZONE}"
@@ -25,7 +27,9 @@ observe = ${OBSERVE}
 [service]
 poll_interval = "${POLL_INTERVAL}s"
 planning_horizon = "${PLANNING_HORIZON}s"
+near_horizon = "${NEAR_HORIZON}s"
 slot_duration = "${SLOT_DURATION}s"
+far_slot_duration = "${FAR_SLOT_DURATION}s"
 web_port = ${INGRESS_PORT}
 EOF
 
@@ -81,11 +85,17 @@ EOF
 for site in $(bashio::config 'solcast.sites|keys'); do
     SITE_NAME=$(bashio::config "solcast.sites[${site}].name")
     SITE_ID=$(bashio::config "solcast.sites[${site}].id")
+    SITE_TILT=$(bashio::config "solcast.sites[${site}].tilt")
+    SITE_AZIMUTH=$(bashio::config "solcast.sites[${site}].azimuth")
+    [ -z "${SITE_TILT}" ] || [ "${SITE_TILT}" = "null" ] && SITE_TILT=0
+    [ -z "${SITE_AZIMUTH}" ] || [ "${SITE_AZIMUTH}" = "null" ] && SITE_AZIMUTH=0
     cat >> "${CONFIG}" <<EOF
 
 [[solcast.sites]]
 name = "${SITE_NAME}"
 id = "${SITE_ID}"
+tilt = ${SITE_TILT}
+azimuth = ${SITE_AZIMUTH}
 EOF
 done
 
@@ -166,6 +176,17 @@ confidence_threshold = ${CONFIDENCE_THRESHOLD}
 min_charge_kw = ${MIN_CHARGE_KW}
 blip_cost = ${BLIP_COST}
 EOF
+
+# --- PV model (learned far-horizon PV) ---
+MAX_PV_KW=""
+bashio::config.has_value 'pv_model.max_pv_kw' && MAX_PV_KW=$(bashio::config 'pv_model.max_pv_kw')
+if [ -n "${MAX_PV_KW}" ] && [ "${MAX_PV_KW}" != "null" ]; then
+    cat >> "${CONFIG}" <<EOF
+
+[pv_model]
+max_pv_kw = ${MAX_PV_KW}
+EOF
+fi
 
 # --- MQTT (actuation commands + the optimiser's decision/time-remaining sensors) ---
 MQTT_BROKER=""

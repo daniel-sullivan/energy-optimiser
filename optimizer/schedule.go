@@ -11,13 +11,15 @@ type Schedule struct {
 // Slot is a single time slot in the schedule.
 type Slot struct {
 	Start         time.Time
-	GridCharge    bool    // actively charging battery from grid
-	BatteryFlowKW float64 // positive=charge, negative=discharge
-	GridImportKW  float64 // power drawn from grid
-	GridExportKW  float64 // power exported to grid
-	SOC           float64 // battery SOC at end of slot (0-1)
-	SolarKW       float64 // forecast solar for this slot
-	LoadKW        float64 // forecast load for this slot
+	End           time.Time // slot end (Start + DurationH); telescoping grids have variable widths
+	DurationH     float64   // slot width in hours (0.5 near-horizon, 1.0 far-horizon)
+	GridCharge    bool      // actively charging battery from grid
+	BatteryFlowKW float64   // positive=charge, negative=discharge
+	GridImportKW  float64   // power drawn from grid
+	GridExportKW  float64   // power exported to grid
+	SOC           float64   // battery SOC at end of slot (0-1)
+	SolarKW       float64   // forecast solar for this slot
+	LoadKW        float64   // forecast load for this slot
 }
 
 // CurrentSlot returns the slot containing the given time, or nil.

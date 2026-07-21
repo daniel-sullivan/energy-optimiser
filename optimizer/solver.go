@@ -35,7 +35,10 @@ const (
 // required.
 func Solve(in *Input) (*Schedule, error) {
 	T := in.NumSlots
-	slotHours := float64(in.SlotMinutes) / 60.0
+	// Per-slot widths (hours) drive every energy/cost term: a telescoping grid has
+	// 30-min near slots and 60-min far slots, so a scalar slot width would double-
+	// or halve-count energy and mis-scale the SOC penalties in the far horizon.
+	h := in.SlotHours
 	// Split round-trip efficiency into symmetric charge/discharge factors so
 	// charging gains less and discharging loses more (η_c·η_d = round-trip η).
 	etaC := math.Sqrt(in.Battery.Efficiency)
@@ -99,16 +102,27 @@ func Solve(in *Input) (*Schedule, error) {
 
 	// ---------- Objective ----------
 	// grid_import cost, −grid_export revenue, blip cost per bypass entry, and the
-	// three SOC-protection penalties (scaled to currency).
+	// three SOC-protection penalties (scaled to currency). The tariff terms are
+	// energy (¥/kWh · kW · h), weighted by the slot width h[t]. The SOC penalties
+	// are a per-slot discomfort tuned on the fine grid; they are weighted by the
+	// slot width relative to a fine slot (penScaleH = h[t]/fineH), so a far 60-min
+	// slot costs exactly what two 30-min slots would and a uniform 30-min grid
+	// reproduces the pre-telescoping penalty weight unchanged. BlipCost is
+	// per-entry (width-free).
+	fineH := float64(in.SlotMinutes) / 60.0
+	if fineH <= 0 {
+		fineH = h[0]
+	}
 	var obj []milp.Term
 	for t := range T {
+		penScaleH := h[t] / fineH
 		obj = append(obj,
-			milp.Term{Var: gridImport[t], Coef: in.Rates[t] * slotHours},
-			milp.Term{Var: gridExport[t], Coef: -in.FeedInRate * slotHours},
+			milp.Term{Var: gridImport[t], Coef: in.Rates[t] * h[t]},
+			milp.Term{Var: gridExport[t], Coef: -in.FeedInRate * h[t]},
 			milp.Term{Var: start[t], Coef: in.BlipCost},
-			milp.Term{Var: penLow[t], Coef: in.SOCRiskWeight * penWeightLow * penScale},
-			milp.Term{Var: penMed[t], Coef: in.SOCRiskWeight * penWeightMed * penScale},
-			milp.Term{Var: penHigh[t], Coef: in.SOCRiskWeight * penWeightHigh * penScale},
+			milp.Term{Var: penLow[t], Coef: in.SOCRiskWeight * penWeightLow * penScale * penScaleH},
+			milp.Term{Var: penMed[t], Coef: in.SOCRiskWeight * penWeightMed * penScale * penScaleH},
+			milp.Term{Var: penHigh[t], Coef: in.SOCRiskWeight * penWeightHigh * penScale * penScaleH},
 		)
 	}
 	m.SetObjective(milp.Minimize, obj)
@@ -127,8 +141,8 @@ func Solve(in *Input) (*Schedule, error) {
 		m.AddConstraint([]milp.Term{
 			{Var: soc[t+1], Coef: 1},
 			{Var: soc[t], Coef: -1},
-			{Var: charge[t], Coef: -etaC * slotHours / capKWh},
-			{Var: discharge[t], Coef: slotHours / (etaD * capKWh)},
+			{Var: charge[t], Coef: -etaC * h[t] / capKWh},
+			{Var: discharge[t], Coef: h[t] / (etaD * capKWh)},
 		}, milp.EqualTo, 0)
 
 		// 3. Charge limit: charge - grid_charge·(max_charge - surplus) ≤ surplus
@@ -207,9 +221,11 @@ func Solve(in *Input) (*Schedule, error) {
 		Slots:          make([]Slot, T),
 	}
 	for t := range T {
-		slotStart := in.Now.Add(time.Duration(t) * time.Duration(in.SlotMinutes) * time.Minute)
+		slotStart := in.SlotStart[t]
 		sched.Slots[t] = Slot{
 			Start:         slotStart,
+			End:           slotStart.Add(hoursToDuration(h[t])),
+			DurationH:     h[t],
 			GridCharge:    sol.Value(gridCharge[t]) > 0.5,
 			BatteryFlowKW: sol.Value(charge[t]) - sol.Value(discharge[t]),
 			GridImportKW:  sol.Value(gridImport[t]),

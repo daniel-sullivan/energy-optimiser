@@ -7,6 +7,20 @@ import (
 	"energy-optimiser/config"
 )
 
+// fillUniform populates SlotStart/SlotHours for a uniform grid of NumSlots slots
+// of SlotMinutes width from Now — the shape PrepareInput produces for a
+// non-telescoping config. Tests that construct Input directly use this so the
+// solver's per-slot Δh terms have their widths.
+func fillUniform(in *Input) {
+	dur := time.Duration(in.SlotMinutes) * time.Minute
+	in.SlotStart = make([]time.Time, in.NumSlots)
+	in.SlotHours = make([]float64, in.NumSlots)
+	for i := range in.NumSlots {
+		in.SlotStart[i] = in.Now.Add(time.Duration(i) * dur)
+		in.SlotHours[i] = dur.Hours()
+	}
+}
+
 func TestSolveBasic(t *testing.T) {
 	// Small 4-slot problem: 2h horizon, 30-min slots
 	// Slots 0-1: off-peak, slots 2-3: peak
@@ -39,6 +53,7 @@ func TestSolveBasic(t *testing.T) {
 		MinChargeKW:   1.0,
 		BlipCost:      5.0,
 	}
+	fillUniform(input)
 
 	sched, err := Solve(input)
 	if err != nil {
@@ -119,6 +134,7 @@ func TestContiguityAndNoDischargeInBypass(t *testing.T) {
 		},
 		PeakRate: 40.0, SOCRiskWeight: 2.0, MinChargeKW: 1.0, BlipCost: 5.0,
 	}
+	fillUniform(in)
 	sched, err := Solve(in)
 	if err != nil {
 		t.Fatal(err)
@@ -170,6 +186,7 @@ func TestPeakSlotsNeverGridCharge(t *testing.T) {
 		Battery: config.Battery{CapacityKWh: 9.6, MaxChargeKW: 5, MaxDischargeKW: 5, SOCMin: 0.20, SOCMax: 1.0, Efficiency: 0.95},
 		PeakRate: 40.0, SOCRiskWeight: 2.0, MinChargeKW: 1.0, BlipCost: 5.0,
 	}
+	fillUniform(in)
 	sched, err := Solve(in)
 	if err != nil {
 		t.Fatal(err)
@@ -192,6 +209,7 @@ func TestGlitchedSOCAboveMaxDoesNotCrash(t *testing.T) {
 		Battery:    config.Battery{CapacityKWh: 9.6, MaxChargeKW: 5, MaxDischargeKW: 5, SOCMin: 0.20, SOCMax: 1.0, Efficiency: 0.95},
 		PeakRate:   32.78, SOCRiskWeight: 2.0, MinChargeKW: 1.0, BlipCost: 5.0,
 	}
+	fillUniform(in)
 	sched, err := Solve(in)
 	if err != nil {
 		t.Fatalf("solve must not be infeasible on a glitched SOC reading: %v", err)

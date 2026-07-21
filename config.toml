@@ -8,8 +8,10 @@ observe = false
 
 [service]
 poll_interval = "5m"
-planning_horizon = "72h"
+planning_horizon = "96h"       # total horizon; the grid telescopes past near_horizon
+near_horizon = "72h"           # fine (slot_duration) grid extent; beyond it, far_slot_duration is used (0 = uniform grid)
 slot_duration = "30m"
+far_slot_duration = "60m"      # coarse slot width beyond near_horizon (must divide 60m; off-peak windows must be hour-aligned)
 web_port = 8080
 
 [influxdb]
@@ -42,6 +44,8 @@ poll_times = ["06:00", "12:00"]
 [[solcast.sites]]
 name = "house"
 id = "your-site-id"
+tilt = 30                      # panel tilt degrees; drives the Open-Meteo tilted-irradiance far-horizon model
+azimuth = 180                  # compass degrees (180 = due south)
 
 [weather]
 latitude = -33.87
@@ -74,6 +78,12 @@ soc_risk_weight = 2.0
 confidence_threshold = 0.3  # below this, use conservative defaults
 min_charge_kw = 1.0         # a grid-charge permit must yield >= this (no empty-bypass)
 blip_cost = 5.0             # currency penalty per bypass entry (skips marginal windows)
+
+# [pv_model]
+# max_pv_kw = 25            # physical ceiling (kW) on the learned far-horizon PV model; 0/unset = unbounded.
+#                           # Set it to a generous multiple of your inverter AC cap so a stuck or
+#                           # unit-relabelled PV sensor can't inflate the learned reference (and
+#                           # high-fault days are dropped from calibration). Optional, backward-compatible.
 
 [mqtt]
 broker = "tcp://localhost:1883"

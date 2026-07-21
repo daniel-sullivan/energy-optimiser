@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -15,7 +17,23 @@ import (
 	"energy-optimiser/influx"
 	"energy-optimiser/loadmodel"
 	"energy-optimiser/optimizer"
+	"energy-optimiser/pvmodel"
 	"energy-optimiser/serve"
+)
+
+// Refresh cadences for the background forecast sources.
+const (
+	// solarRetryInterval bounds retries of the Solcast fetch while its cache is
+	// still nil (a failed/never-run initial fetch), so a startup failure recovers
+	// without hammering the API.
+	solarRetryInterval = 10 * time.Minute
+	// weatherRefreshInterval is the normal Open-Meteo GTI refresh cadence; the GTI
+	// forecast moves slowly, so a few times a day is ample.
+	weatherRefreshInterval = 6 * time.Hour
+	// weatherRetryInterval bounds retries while the weather cache is still nil.
+	weatherRetryInterval = 10 * time.Minute
+	// solarResidualLogInterval rate-limits the learned-vs-Solcast RMSE log line.
+	solarResidualLogInterval = 1 * time.Hour
 )
 
 // Hub is the central coordinator that runs the 5-minute tick loop.
@@ -24,6 +42,7 @@ type Hub struct {
 	influx      *influx.Client // nil if unavailable
 	solcast     *forecast.SolcastClient
 	weather     *forecast.WeatherClient
+	pvModel     *pvmodel.Model // nil if the persistent model could not be prepared
 	loadModel   *loadmodel.Model
 	ha          *ha.Client
 	actuator    *actuator.Actuator
@@ -37,6 +56,17 @@ type Hub struct {
 	schedule    *optimizer.Schedule
 	lastTick    time.Time
 	subscribers map[*serve.Subscriber]struct{}
+
+	// Refresh/log bookkeeping — touched only on the single-threaded tick path.
+	lastSolcastAttempt time.Time
+	lastWeatherAttempt time.Time
+	lastResidualLog    time.Time
+
+	// refreshMu guards the single-flight weather+model refresh: a slow Open-Meteo
+	// fetch + fsync'd pvModel.Update runs on a background goroutine, and a new one
+	// must not launch while the previous is still running.
+	refreshMu      sync.Mutex
+	refreshRunning bool
 }
 
 func New(cfg *config.Config, dryRun bool) (*Hub, error) {
@@ -62,6 +92,14 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		}
 	}
 	h.influx = db
+
+	// Persistent PV-response model (far-horizon fill). Non-fatal: on error the
+	// optimiser still runs, the fill degrades to Solcast-only (0 beyond coverage).
+	if pm, err := pvmodel.New(cfg.PVModel); err != nil {
+		slog.Warn("pv model unavailable — far-horizon solar fill disabled", "error", err)
+	} else {
+		h.pvModel = pm
+	}
 
 	// Actuator — skips MQTT connection in dry-run
 	act, err := actuator.New(cfg.MQTT, h.ha, dryRun)
@@ -143,12 +181,18 @@ func (h *Hub) Run(ctx context.Context) error {
 
 	// Initial solar forecast (non-fatal)
 	if cfg := h.cfg.Solcast; cfg.APIKey != "" {
+		h.lastSolcastAttempt = time.Now()
 		if _, err := h.solcast.Fetch(ctx); err != nil {
 			slog.Warn("initial solar forecast failed", "error", err)
 		}
 	} else {
 		slog.Info("solcast API key not configured, skipping solar forecast")
 	}
+
+	// Initial weather (GTI) fetch + PV model warm-up (non-fatal), kicked off in the
+	// background so the first tick isn't blocked by a slow Open-Meteo fetch. The
+	// far-horizon fill degrades to Solcast-only until the model warms — acceptable.
+	h.startRefreshWeatherAndModel(ctx, time.Now().In(h.cfg.Location()))
 
 	// Tick loop
 	ticker := time.NewTicker(h.cfg.Service.PollInterval.Duration)
@@ -166,6 +210,15 @@ func (h *Hub) Run(ctx context.Context) error {
 }
 
 func (h *Hub) tick(ctx context.Context) {
+	// Defense in depth: a single bad tick (e.g. a config-driven BuildGrid
+	// invariant panic) must never kill the daemon — recover, log with the stack,
+	// and skip this tick so the next one runs.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("tick panicked — skipping this tick", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
 	// Floor to the slot boundary so solar/load vectors, tariff windows, and the
 	// schedule grid all align (PrepareInput floors too; keep them consistent).
 	now := time.Now().In(h.cfg.Location()).Truncate(h.cfg.Service.SlotDuration.Duration)
@@ -174,6 +227,7 @@ func (h *Hub) tick(ctx context.Context) {
 	if h.cfg.Solcast.APIKey != "" {
 		h.maybeRefreshSolar(ctx, now)
 	}
+	h.maybeRefreshWeather(ctx, now)
 
 	currentSOC := h.ha.StateFloat(h.cfg.HomeAssistant.Entities.BatterySOC) / 100.0
 	if currentSOC == 0 {
@@ -182,8 +236,12 @@ func (h *Hub) tick(ctx context.Context) {
 		currentSOC = 0.5 // safe default
 	}
 
-	solarKW := h.solarForecastSlots(now)
-	loadW := h.loadModel.Predict(h.slotTimes(now))
+	// Build the telescoping slot grid once and thread it through the forecast and
+	// load vectors; PrepareInput rebuilds the same deterministic grid internally.
+	grid := optimizer.BuildGrid(now, h.cfg)
+
+	solarKW := h.solarForecastSlots(grid, now)
+	loadW := h.loadModel.Predict(grid.Start)
 
 	input := optimizer.PrepareInput(now, h.cfg, solarKW, loadW, currentSOC)
 	sched, err := optimizer.Solve(input)
@@ -226,15 +284,27 @@ func (h *Hub) tick(ctx context.Context) {
 	h.broadcast()
 }
 
+// maybeRefreshSolar refreshes the Solcast forecast when a poll time has passed
+// since the cache was last fetched. A NIL cache (the initial fetch failed, or has
+// not run) must TRIGGER a rate-limited retry — not suppress fetching for the whole
+// process life — so a single startup failure is recoverable (M3 fix).
 func (h *Hub) maybeRefreshSolar(ctx context.Context, now time.Time) {
 	cached := h.solcast.Cached()
 	if cached == nil {
+		if h.lastSolcastAttempt.IsZero() || now.Sub(h.lastSolcastAttempt) >= solarRetryInterval {
+			h.lastSolcastAttempt = now
+			slog.Info("retrying initial solar forecast")
+			if _, err := h.solcast.Fetch(ctx); err != nil {
+				slog.Warn("solar refresh failed", "error", err)
+			}
+		}
 		return
 	}
 	for _, pt := range h.cfg.Solcast.PollTimes {
 		target := time.Date(now.Year(), now.Month(), now.Day(),
 			pt.Hour, pt.Minute, 0, 0, now.Location())
 		if now.After(target) && cached.FetchedAt.Before(target) {
+			h.lastSolcastAttempt = now
 			slog.Info("refreshing solar forecast")
 			if _, err := h.solcast.Fetch(ctx); err != nil {
 				slog.Warn("solar refresh failed", "error", err)
@@ -244,43 +314,140 @@ func (h *Hub) maybeRefreshSolar(ctx context.Context, now time.Time) {
 	}
 }
 
-func (h *Hub) solarForecastSlots(now time.Time) []float64 {
-	cached := h.solcast.Cached()
+// maybeRefreshWeather refreshes the Open-Meteo GTI forecast on a periodic cadence,
+// and — mirroring the M3 fix — retries on a backoff while the cache is still nil
+// rather than suppressing fetching after a failed first attempt. A successful
+// fetch also folds the completed past days into the PV model.
+func (h *Hub) maybeRefreshWeather(ctx context.Context, now time.Time) {
+	if h.weather == nil || len(h.cfg.Solcast.Sites) == 0 {
+		return
+	}
+	cached := h.weather.Cached()
+	var due bool
 	if cached == nil {
-		return nil
+		due = h.lastWeatherAttempt.IsZero() || now.Sub(h.lastWeatherAttempt) >= weatherRetryInterval
+	} else {
+		due = now.Sub(cached.FetchedAt) >= weatherRefreshInterval
 	}
-	slotMins := int(h.cfg.Service.SlotDuration.Minutes())
-	numSlots := int(h.cfg.Service.PlanningHorizon.Minutes()) / slotMins
-	out := make([]float64, numSlots)
-
-	for i := range out {
-		slotStart := now.Add(time.Duration(i) * time.Duration(slotMins) * time.Minute)
-		slotEnd := slotStart.Add(time.Duration(slotMins) * time.Minute)
-		// Average all forecast points overlapping the slot (mean power), so a
-		// slot spanning multiple Solcast periods isn't truncated to the first.
-		var sum float64
-		var n int
-		for _, p := range cached.Points {
-			if !p.Time.Before(slotStart) && p.Time.Before(slotEnd) {
-				sum += p.EstimateKW
-				n++
-			}
-		}
-		if n > 0 {
-			out[i] = sum / float64(n)
-		}
+	if due {
+		h.startRefreshWeatherAndModel(ctx, now)
 	}
-	return out
 }
 
-func (h *Hub) slotTimes(now time.Time) []time.Time {
-	slotMins := int(h.cfg.Service.SlotDuration.Minutes())
-	numSlots := int(h.cfg.Service.PlanningHorizon.Minutes()) / slotMins
-	out := make([]time.Time, numSlots)
-	for i := range out {
-		out[i] = now.Add(time.Duration(i) * time.Duration(slotMins) * time.Minute)
+// startRefreshWeatherAndModel runs refreshWeatherAndModel on a background
+// goroutine, single-flighted: if a refresh is still running it is a no-op. This
+// keeps the slow Open-Meteo fetch (N sites @30s timeout) and the fsync'd
+// pvModel.Update off the tick thread, so a slow forecast source never stalls the
+// solve/decision/broadcast. lastWeatherAttempt is set here on the tick thread
+// (the only writer) so the tick-path due-check stays race-free.
+func (h *Hub) startRefreshWeatherAndModel(ctx context.Context, now time.Time) {
+	if h.weather == nil || len(h.cfg.Solcast.Sites) == 0 {
+		return
 	}
-	return out
+	h.refreshMu.Lock()
+	if h.refreshRunning {
+		h.refreshMu.Unlock()
+		return
+	}
+	h.refreshRunning = true
+	h.refreshMu.Unlock()
+	h.lastWeatherAttempt = now
+
+	go func() {
+		defer func() {
+			h.refreshMu.Lock()
+			h.refreshRunning = false
+			h.refreshMu.Unlock()
+		}()
+		h.refreshWeatherAndModel(ctx, now)
+	}()
+}
+
+// refreshWeatherAndModel fetches the GTI forecast and, on success, runs the
+// watermark-idempotent PV-model ingest (calibration from past GTI vs measured PV).
+// All steps are non-fatal: the optimiser runs without the far-horizon fill. Runs
+// on the background refresh goroutine (see startRefreshWeatherAndModel); the
+// pvModel's own RWMutex serialises its Update against tick-thread PredictKW reads.
+func (h *Hub) refreshWeatherAndModel(ctx context.Context, now time.Time) {
+	if h.weather == nil || len(h.cfg.Solcast.Sites) == 0 {
+		return
+	}
+	wf, err := h.weather.Fetch(ctx, h.cfg.Solcast.Sites)
+	if err != nil {
+		slog.Warn("weather (GTI) refresh failed", "error", err)
+		return
+	}
+	slog.Info("weather forecast refreshed", "points", len(wf.Points))
+	if h.pvModel == nil || h.influx == nil {
+		return
+	}
+	if err := h.pvModel.Update(ctx, h.pvHistory(), wf, now); err != nil {
+		slog.Warn("pv model ingest failed", "error", err)
+		return
+	}
+	slog.Info("pv model updated", "maturity_now", fmt.Sprintf("%.2f", h.pvModel.Maturity(now)))
+}
+
+// pvHistory binds the metrics client to the PV entity as a pvmodel.PVHistory.
+// Only called when h.influx != nil.
+func (h *Hub) pvHistory() pvmodel.PVHistory {
+	return pvHistorySource{client: h.influx, entityID: h.cfg.HomeAssistant.Entities.PVPower}
+}
+
+// solarForecastSlots produces the per-slot solar kW: Solcast within its coverage,
+// the learned PV model × Open-Meteo GTI beyond, with a 6h crossfade at the seam.
+func (h *Hub) solarForecastSlots(grid optimizer.Grid, now time.Time) []float64 {
+	solar := h.solcast.Cached()
+	var weather *forecast.WeatherForecast
+	if h.weather != nil {
+		weather = h.weather.Cached()
+	}
+	var model PVPredictor
+	if h.pvModel != nil {
+		model = h.pvModel
+	}
+	h.logSolarResidual(now, grid, solar, weather, model)
+	return fillSolarSlots(grid, now, solar, weather, model)
+}
+
+// logSolarResidual logs, at most hourly, the RMSE between the learned model and
+// Solcast over their overlap (Solcast-covered slots the model can also predict),
+// so far-horizon accuracy is observable over time. The learned side is compared
+// WITHOUT the lead-time haircut — this measures calibration, not the applied fill.
+func (h *Hub) logSolarResidual(now time.Time, grid optimizer.Grid, solar *forecast.SolarForecast, weather *forecast.WeatherForecast, model PVPredictor) {
+	if solar == nil || weather == nil || model == nil {
+		return
+	}
+	if !h.lastResidualLog.IsZero() && now.Sub(h.lastResidualLog) < solarResidualLogInterval {
+		return
+	}
+	coverageEnd := solcastCoverageEnd(solar, now)
+	var sumSq float64
+	var overlap int
+	for i := range grid.Start {
+		ts := grid.Start[i]
+		if !ts.Before(coverageEnd) {
+			break
+		}
+		sol, ok := averageSolcast(solar, ts, grid.End(i))
+		if !ok {
+			continue
+		}
+		gti := interpolateGTI(weather.Points, ts)
+		if len(gti) == 0 {
+			continue
+		}
+		d := model.PredictKW(ts, gti) - sol
+		sumSq += d * d
+		overlap++
+	}
+	if overlap == 0 {
+		return
+	}
+	h.lastResidualLog = now
+	slog.Info("solar model residual vs solcast",
+		"rmse_kw", fmt.Sprintf("%.3f", math.Sqrt(sumSq/float64(overlap))),
+		"overlap_slots", overlap)
 }
 
 func (h *Hub) recordDecision(ctx context.Context, now time.Time, slot *optimizer.Slot) {

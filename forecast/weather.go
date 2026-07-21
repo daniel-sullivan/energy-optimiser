@@ -5,48 +5,135 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"sort"
+	"sync"
 	"time"
 
 	"energy-optimiser/config"
 )
 
-// WeatherClient fetches 72h weather forecasts from Open-Meteo.
+// openMeteoBaseURL is the production Open-Meteo host.
+const openMeteoBaseURL = "https://api.open-meteo.com"
+
+// WeatherClient fetches global tilted irradiance (GTI) forecasts from
+// Open-Meteo for the far-horizon PV model. Sites (with their tilt/azimuth)
+// are supplied at Fetch time, not construction.
 type WeatherClient struct {
 	lat, lon float64
 	http     *http.Client
+	baseURL  string // overridden in tests; defaults to openMeteoBaseURL
+
+	mu    sync.RWMutex
+	cache *WeatherForecast
 }
 
-// WeatherForecast contains hourly weather data.
+// WeatherForecast is a cached, combined GTI forecast spanning past+future days.
 type WeatherForecast struct {
 	FetchedAt time.Time
-	Points    []WeatherPoint
+	Points    []GTIPoint // hourly, chronological, period-START timestamps in UTC
 }
 
-// WeatherPoint is a single hourly observation.
-type WeatherPoint struct {
-	Time        time.Time
-	Temperature float64 // °C
-	Humidity    float64 // %
-	CloudCover  float64 // %
+// GTIPoint is one hour's global tilted irradiance, per site.
+type GTIPoint struct {
+	Time time.Time          // start of the hour, UTC
+	GTI  map[string]float64 // site name -> plane-of-array irradiance (W/m²) for that hour
 }
 
 func NewWeather(cfg config.Weather) *WeatherClient {
 	return &WeatherClient{
-		lat:  cfg.Latitude,
-		lon:  cfg.Longitude,
-		http: &http.Client{Timeout: 30 * time.Second},
+		lat:     cfg.Latitude,
+		lon:     cfg.Longitude,
+		http:    &http.Client{Timeout: 30 * time.Second},
+		baseURL: openMeteoBaseURL,
 	}
 }
 
-// Fetch retrieves the 72h weather forecast.
-func (c *WeatherClient) Fetch(ctx context.Context) (*WeatherForecast, error) {
-	url := fmt.Sprintf(
-		"https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"+
-			"&hourly=temperature_2m,relative_humidity_2m,cloud_cover"+
-			"&forecast_days=3&timezone=auto",
-		c.lat, c.lon,
-	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// orientation identifies a distinct tilt/azimuth combination. Sites sharing
+// an orientation are served from a single Open-Meteo request.
+type orientation struct {
+	tilt, azimuth float64 // azimuth in the config's compass convention (180=south)
+}
+
+// gtiSample is one hourly GTI value for a single orientation.
+type gtiSample struct {
+	Time  time.Time
+	Value float64
+}
+
+// Fetch retrieves hourly GTI (past 21 days + next 7 days) for each configured
+// site's orientation, merges the per-orientation series into a per-site GTI
+// map keyed by hour, and caches the combined result. Sites that share a
+// tilt/azimuth are fetched once and reused.
+func (c *WeatherClient) Fetch(ctx context.Context, sites []config.SolcastSite) (*WeatherForecast, error) {
+	if len(sites) == 0 {
+		return nil, fmt.Errorf("weather: no sites configured")
+	}
+
+	// Group site names by orientation so identical tilt/azimuth pairs only
+	// trigger one HTTP call.
+	groups := map[orientation][]string{}
+	for _, s := range sites {
+		key := orientation{tilt: s.Tilt, azimuth: s.Azimuth}
+		groups[key] = append(groups[key], s.Name)
+	}
+
+	times := map[int64]time.Time{}
+	gti := map[int64]map[string]float64{} // period-start unix -> site name -> W/m²
+
+	for key, names := range groups {
+		samples, err := c.fetchOrientation(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("weather orientation tilt=%.1f azimuth=%.1f: %w", key.tilt, key.azimuth, err)
+		}
+		for _, sm := range samples {
+			ts := sm.Time.Unix()
+			times[ts] = sm.Time
+			if gti[ts] == nil {
+				gti[ts] = make(map[string]float64, len(names))
+			}
+			for _, name := range names {
+				gti[ts][name] = sm.Value
+			}
+		}
+	}
+
+	points := make([]GTIPoint, 0, len(gti))
+	for ts, m := range gti {
+		points = append(points, GTIPoint{Time: times[ts], GTI: m})
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i].Time.Before(points[j].Time) })
+
+	forecast := &WeatherForecast{FetchedAt: time.Now(), Points: points}
+	c.mu.Lock()
+	c.cache = forecast
+	c.mu.Unlock()
+	return forecast, nil
+}
+
+// fetchOrientation retrieves the hourly GTI series for one tilt/azimuth pair,
+// spanning the past 21 days and next 7 days.
+func (c *WeatherClient) fetchOrientation(ctx context.Context, o orientation) ([]gtiSample, error) {
+	// Open-Meteo's azimuth convention is 0=south, -90=east, +90=west, which
+	// differs from the config's compass convention (180=south). Convert.
+	omAzimuth := o.azimuth - 180
+
+	q := url.Values{}
+	q.Set("latitude", fmt.Sprintf("%.4f", c.lat))
+	q.Set("longitude", fmt.Sprintf("%.4f", c.lon))
+	q.Set("hourly", "global_tilted_irradiance")
+	q.Set("tilt", fmt.Sprintf("%.1f", o.tilt))
+	q.Set("azimuth", fmt.Sprintf("%.1f", omAzimuth))
+	q.Set("past_days", "21")
+	q.Set("forecast_days", "7")
+	// timezone=UTC + timeformat=unixtime avoids the local-string/UTC
+	// ambiguity of timezone=auto: timestamps decode as unambiguous epoch
+	// seconds rather than requiring a timezone-aware string parse.
+	q.Set("timezone", "UTC")
+	q.Set("timeformat", "unixtime")
+
+	reqURL := c.baseURL + "/v1/forecast?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -67,47 +154,28 @@ func (c *WeatherClient) Fetch(ctx context.Context) (*WeatherForecast, error) {
 	}
 
 	h := result.Hourly
-	n := min(len(h.Time), len(h.Temperature), len(h.Humidity), len(h.CloudCover))
-	forecast := &WeatherForecast{
-		FetchedAt: time.Now(),
-		Points:    make([]WeatherPoint, 0, n),
-	}
+	n := min(len(h.Time), len(h.GTI))
+	samples := make([]gtiSample, 0, n)
 	for i := range n {
-		t, err := time.Parse("2006-01-02T15:04", h.Time[i])
-		if err != nil {
-			continue
-		}
-		forecast.Points = append(forecast.Points, WeatherPoint{
-			Time:        t,
-			Temperature: h.Temperature[i],
-			Humidity:    h.Humidity[i],
-			CloudCover:  h.CloudCover[i],
-		})
+		// Open-Meteo hourly radiation values are the mean of the PRECEDING
+		// hour (the value stamped 10:00 covers 09:00-10:00). Shift back one
+		// hour so Time is the START of the hour the irradiance applies to.
+		t := time.Unix(h.Time[i], 0).UTC().Add(-time.Hour)
+		samples = append(samples, gtiSample{Time: t, Value: h.GTI[i]})
 	}
-	return forecast, nil
+	return samples, nil
 }
 
-// TemperatureAt returns the interpolated temperature at a given time.
-func (f *WeatherForecast) TemperatureAt(t time.Time) float64 {
-	if f == nil || len(f.Points) == 0 {
-		return 25 // default
-	}
-	// Find bracketing points
-	for i := 1; i < len(f.Points); i++ {
-		if f.Points[i].Time.After(t) {
-			p0, p1 := f.Points[i-1], f.Points[i]
-			frac := t.Sub(p0.Time).Seconds() / p1.Time.Sub(p0.Time).Seconds()
-			return p0.Temperature + frac*(p1.Temperature-p0.Temperature)
-		}
-	}
-	return f.Points[len(f.Points)-1].Temperature
+// Cached returns the most recent cached forecast, or nil.
+func (c *WeatherClient) Cached() *WeatherForecast {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cache
 }
 
 type openMeteoResponse struct {
 	Hourly struct {
-		Time        []string  `json:"time"`
-		Temperature []float64 `json:"temperature_2m"`
-		Humidity    []float64 `json:"relative_humidity_2m"`
-		CloudCover  []float64 `json:"cloud_cover"`
+		Time []int64   `json:"time"`
+		GTI  []float64 `json:"global_tilted_irradiance"`
 	} `json:"hourly"`
 }

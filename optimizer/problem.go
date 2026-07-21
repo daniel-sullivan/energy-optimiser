@@ -11,7 +11,10 @@ import (
 type Input struct {
 	Now         time.Time
 	NumSlots    int
-	SlotMinutes int
+	SlotMinutes int // width of the first (fine) slot; display only — per-slot math uses SlotHours
+
+	SlotStart []time.Time // slot start times (telescoping grid; len == NumSlots)
+	SlotHours []float64   // slot widths in hours (variable; drives all per-slot energy/cost math)
 
 	SolarKW   []float64 // predicted solar per slot (kW)
 	LoadKW    []float64 // predicted load per slot (kW)
@@ -28,8 +31,11 @@ type Input struct {
 }
 
 // PrepareInput builds solver input from config, forecasts, and current state.
-// now is floored to the slot boundary so plans stay stable across re-solves and
-// tariff windows align to slots exactly.
+// The telescoping slot grid comes from BuildGrid, which floors now to the slot
+// boundary so plans stay stable across re-solves and tariff windows align to
+// slots exactly. Solar and load are expected already aligned to that grid
+// (hub/backtest build them from the same BuildGrid); they are padded/truncated
+// to the grid length as a guard.
 func PrepareInput(
 	now time.Time,
 	cfg *config.Config,
@@ -37,10 +43,9 @@ func PrepareInput(
 	loadW []float64,
 	currentSOC float64,
 ) *Input {
-	slotMins := int(cfg.Service.SlotDuration.Minutes())
-	numSlots := int(cfg.Service.PlanningHorizon.Minutes()) / slotMins
-
-	now = now.Truncate(time.Duration(slotMins) * time.Minute)
+	grid := BuildGrid(now, cfg)
+	numSlots := grid.Len()
+	start := grid.Start[0]
 
 	solar := padSlice(solarKW, numSlots)
 	load := make([]float64, numSlots)
@@ -53,15 +58,17 @@ func PrepareInput(
 	rates := make([]float64, numSlots)
 	offPeak := make([]bool, numSlots)
 	for i := range numSlots {
-		t := now.Add(time.Duration(i) * time.Duration(slotMins) * time.Minute)
+		t := grid.Start[i]
 		rates[i] = cfg.Rates.RateAt(t)
 		offPeak[i] = cfg.Rates.IsOffPeak(t)
 	}
 
 	return &Input{
-		Now:           now,
+		Now:           start,
 		NumSlots:      numSlots,
-		SlotMinutes:   slotMins,
+		SlotMinutes:   int(cfg.Service.SlotDuration.Minutes()),
+		SlotStart:     grid.Start,
+		SlotHours:     grid.Hours,
 		SolarKW:       solar,
 		LoadKW:        load,
 		Rates:         rates,

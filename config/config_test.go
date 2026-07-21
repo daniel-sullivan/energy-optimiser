@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,7 +204,7 @@ func TestRateAtPerWindow(t *testing.T) {
 		PeakRate:    32.78,
 		OffPeakRate: 21.61, // fallback
 		OffPeakWindows: []TimeWindow{
-			{Start: TimeOfDay{1, 0}, End: TimeOfDay{5, 0}, Rate: 21.61},  // night
+			{Start: TimeOfDay{1, 0}, End: TimeOfDay{5, 0}, Rate: 21.61},   // night
 			{Start: TimeOfDay{11, 0}, End: TimeOfDay{13, 0}, Rate: 19.61}, // day (cheaper)
 			{Start: TimeOfDay{22, 0}, End: TimeOfDay{23, 0}},              // no rate -> fallback
 		},
@@ -238,4 +239,66 @@ func TestMQTTTopics(t *testing.T) {
 	if got != want {
 		t.Errorf("StateTopic = %q, want %q", got, want)
 	}
+}
+
+// parseTOML writes toml to a temp file and parses it, returning any error.
+func parseTOML(t *testing.T, toml string) error {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "cfg-*.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(toml); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	_, err = Parse(f.Name())
+	return err
+}
+
+// TestTelescopingRejectsHalfHourOffPeakEdge: a :30 off-peak edge under an active
+// telescoping grid must fail fast at load — otherwise BuildGrid panics later
+// (crash-loop) on the coarse slot that straddles the edge. A uniform grid (no
+// telescoping) keeps accepting sub-hour edges, unchanged.
+func TestTelescopingRejectsHalfHourOffPeakEdge(t *testing.T) {
+	const rates = `
+[battery]
+capacity_kwh = 9.6
+
+[rates]
+peak_rate = 40.0
+off_peak_rate = 5.0
+feed_in_rate = 1.0
+
+[[rates.off_peak_windows]]
+start = "01:30"
+end = "05:00"
+rate = 5.0
+`
+	t.Run("telescoping_rejected", func(t *testing.T) {
+		err := parseTOML(t, `
+[service]
+planning_horizon = "6h"
+near_horizon = "2h"
+slot_duration = "30m"
+far_slot_duration = "60m"
+`+rates)
+		if err == nil {
+			t.Fatal("expected load to reject a :30 off-peak edge under telescoping")
+		}
+		if !strings.Contains(err.Error(), "01:30-05:00") || !strings.Contains(err.Error(), "whole-hour") {
+			t.Errorf("error = %q, want it to name window 01:30-05:00 and the whole-hour requirement", err)
+		}
+	})
+
+	t.Run("uniform_accepted", func(t *testing.T) {
+		// No far_slot_duration → uniform grid → sub-hour off-peak edges are fine.
+		if err := parseTOML(t, `
+[service]
+planning_horizon = "6h"
+slot_duration = "30m"
+`+rates); err != nil {
+			t.Errorf("uniform grid must accept a :30 off-peak edge, got %v", err)
+		}
+	})
 }

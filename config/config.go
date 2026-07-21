@@ -18,6 +18,7 @@ type Config struct {
 	Battery       Battery       `toml:"battery"`
 	Rates         Rates         `toml:"rates"`
 	Optimizer     Optimizer     `toml:"optimizer"`
+	PVModel       PVModel       `toml:"pv_model"`
 	MQTT          MQTT          `toml:"mqtt"`
 	Alertmanager  Alertmanager  `toml:"alertmanager"`
 	Alerts        Alerts        `toml:"alerts"`
@@ -42,6 +43,11 @@ type Service struct {
 	PollInterval    Duration `toml:"poll_interval"`
 	PlanningHorizon Duration `toml:"planning_horizon"`
 	SlotDuration    Duration `toml:"slot_duration"`
+	// NearHorizon is the extent of the fine (SlotDuration) grid; beyond it the
+	// grid telescopes to FarSlotDuration out to PlanningHorizon. Unset (0) ⇒ the
+	// whole horizon uses SlotDuration (uniform grid, pre-telescoping behaviour).
+	NearHorizon     Duration `toml:"near_horizon"`
+	FarSlotDuration Duration `toml:"far_slot_duration"`
 	WebPort         int      `toml:"web_port"`
 }
 
@@ -80,10 +86,14 @@ type Solcast struct {
 	PollTimes []TimeOfDay   `toml:"poll_times"`
 }
 
-// SolcastSite is one rooftop site; per-site forecasts are summed.
+// SolcastSite is one rooftop site; per-site forecasts are summed. Tilt/Azimuth
+// (degrees; azimuth 180=south) drive the Open-Meteo tilted-irradiance fetch used
+// for the far-horizon PV model.
 type SolcastSite struct {
-	Name string `toml:"name"`
-	ID   string `toml:"id"`
+	Name    string  `toml:"name"`
+	ID      string  `toml:"id"`
+	Tilt    float64 `toml:"tilt"`
+	Azimuth float64 `toml:"azimuth"`
 }
 
 type Weather struct {
@@ -171,6 +181,19 @@ type Optimizer struct {
 	// BlipCost: objective penalty (currency) per bypass entry, so marginal-gain
 	// windows are skipped rather than incurring a load-transfer blip.
 	BlipCost float64 `toml:"blip_cost"`
+}
+
+// PVModel configures the persistent PV-response learning model: the far-horizon
+// asset that learns the transfer function from Open-Meteo tilted irradiance to
+// measured PV, improving over years. State lives under DataDir; the decayed
+// per-bin statistics survive the 60-day retention of the metrics store via a
+// long half-life, so the model keeps maturing across seasons.
+type PVModel struct {
+	DataDir         string  `toml:"data_dir"`         // persistence directory (default /data)
+	HalfLifeDays    float64 `toml:"half_life_days"`   // exponential-decay half-life for bin mass (default 900 ≈ 2.5yr)
+	CalibrationDays int     `toml:"calibration_days"` // rolling window for kWp_ref + cold-start ingest (default 21)
+	MinSamples      float64 `toml:"min_samples"`      // decayed-effective sample count for a bin to be trusted (default 12)
+	MaxPVKW         float64 `toml:"max_pv_kw"`        // physical ceiling on modeled PV output (kW); 0 = unbounded. Bounds a kWp_ref runaway from a sustained PV-sensor fault.
 }
 
 type MQTT struct {
@@ -315,6 +338,19 @@ func (c *Config) finalize() error {
 		c.Optimizer.BlipCost = 5.0
 	}
 
+	if c.PVModel.DataDir == "" {
+		c.PVModel.DataDir = "/data"
+	}
+	if c.PVModel.HalfLifeDays == 0 {
+		c.PVModel.HalfLifeDays = 900
+	}
+	if c.PVModel.CalibrationDays == 0 {
+		c.PVModel.CalibrationDays = 21
+	}
+	if c.PVModel.MinSamples == 0 {
+		c.PVModel.MinSamples = 12
+	}
+
 	if c.TimeZone == "" {
 		c.TimeZone = "Asia/Tokyo"
 	}
@@ -351,6 +387,54 @@ func (c *Config) finalize() error {
 	}
 	if c.Rates.FeedInRate >= minOff {
 		return fmt.Errorf("feed_in_rate (%.2f) must be < cheapest off-peak rate (%.2f)", c.Rates.FeedInRate, minOff)
+	}
+
+	if err := c.validateTelescopingGrid(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTelescopingGrid checks the telescoping-grid geometry when it is active
+// (near_horizon < planning_horizon). The near region must be a whole number of
+// fine slots, the far region a whole number of coarse slots, and each coarse slot
+// must align to the hour so it carries a single tariff rate. A uniform grid
+// (near_horizon unset, >= planning_horizon, or far_slot_duration unset) skips
+// these checks — it is the pre-telescoping behaviour.
+func (c *Config) validateTelescopingGrid() error {
+	near := c.Service.NearHorizon.Duration
+	planning := c.Service.PlanningHorizon.Duration
+	slot := c.Service.SlotDuration.Duration
+	far := c.Service.FarSlotDuration.Duration
+
+	if near <= 0 || near >= planning || far <= 0 {
+		return nil // uniform grid — no telescoping constraints
+	}
+	if slot <= 0 {
+		return fmt.Errorf("slot_duration must be > 0 for a telescoping grid")
+	}
+	if near%slot != 0 {
+		return fmt.Errorf("near_horizon (%s) must be a whole multiple of slot_duration (%s)", near, slot)
+	}
+	if (planning-near)%far != 0 {
+		return fmt.Errorf("planning_horizon − near_horizon (%s) must be a whole multiple of far_slot_duration (%s)", planning-near, far)
+	}
+	if time.Hour%far != 0 {
+		return fmt.Errorf("far_slot_duration (%s) must divide 60m so coarse slots align to the hour", far)
+	}
+	// A coarse slot carries a single tariff rate only if the off-peak windows it
+	// may span never change rate mid-slot. Since coarse slots are hour-aligned
+	// (checked above), any off-peak edge on a :MM ≠ :00 boundary would let a slot
+	// straddle it — the case BuildGrid panics on. Reject it at load so the panic
+	// is unreachable via config.
+	for _, w := range c.Rates.OffPeakWindows {
+		if w.Start.Minute != 0 || w.End.Minute != 0 {
+			edge := w.Start.Minute
+			if edge == 0 {
+				edge = w.End.Minute
+			}
+			return fmt.Errorf("far_slot_duration requires whole-hour off_peak_windows; window %s-%s has a :%02d edge", w.Start, w.End, edge)
+		}
 	}
 	return nil
 }

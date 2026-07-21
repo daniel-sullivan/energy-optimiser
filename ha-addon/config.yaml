@@ -1,7 +1,7 @@
 name: Energy Optimiser
 description: Forecast-driven off-peak battery charge optimiser for solar + battery systems
 slug: energy-optimiser
-version: 0.1.5
+version: 0.2.0
 url: https://github.com/daniel-sullivan/energy-optimiser
 arch:
   - amd64
@@ -24,8 +24,10 @@ options:
   observe: true
   service:
     poll_interval: 300
-    planning_horizon: 259200
+    planning_horizon: 345600
+    near_horizon: 259200
     slot_duration: 1800
+    far_slot_duration: 3600
   homeassistant:
     url: "ws://homeassistant.local:8123/api/websocket"
     token: ""
@@ -44,6 +46,8 @@ options:
     sites:
       - name: "house"
         id: ""
+        tilt: 30
+        azimuth: 180
   weather:
     latitude: -33.87
     longitude: 151.21
@@ -69,6 +73,8 @@ options:
     confidence_threshold: 0.3
     min_charge_kw: 1.0
     blip_cost: 5.0
+  pv_model:
+    max_pv_kw: 25
   mqtt:
     broker: ""
     topic_prefix: "homeassistant"
@@ -87,7 +93,9 @@ schema:
   service:
     poll_interval: "int(10,3600)"
     planning_horizon: "int(3600,604800)"
+    near_horizon: "int(0,604800)"
     slot_duration: "int(60,3600)"
+    far_slot_duration: "int(60,3600)"
   homeassistant:
     url: url
     token: password
@@ -106,6 +114,8 @@ schema:
     sites:
       - name: str
         id: str
+        tilt: float?
+        azimuth: float?
   weather:
     latitude: float
     longitude: float
@@ -131,6 +141,8 @@ schema:
     confidence_threshold: "float(0,1)"
     min_charge_kw: float
     blip_cost: float
+  pv_model:
+    max_pv_kw: "float(0,1000)?"
   mqtt:
     broker: url?
     topic_prefix: str?
