@@ -18,61 +18,41 @@ import (
 // --- test doubles ---
 
 type recordedCall struct {
-	domain      string
-	service     string
-	entity      string
-	option      string
-	value       float64
-	prioAtWrite string // for set_value: output_priority state visible at write time
+	domain  string
+	service string
+	entity  string
+	value   any // set_value payload (string for text, float64 for number)
 }
 
 // fakeHA records service calls and reflects successful writes into its state
-// cache, so the actuator's read-back verification passes. It never touches real
+// cache, so the actuator's read-back confirmation passes. It never touches real
 // hardware.
 type fakeHA struct {
 	mu      sync.Mutex
 	states  map[string]string
 	attrs   map[string]map[string]any
-	fresh   map[string]bool // per-entity; absent ⇒ fresh
+	fresh   map[string]bool // per-entity; absent ⇒ freshOK
 	freshOK bool            // default when entity absent from `fresh`
 	ackErr  error           // if set, CallServiceAck returns it (no reflect)
 	calls   []recordedCall
 
-	// decoupleSelect models HA's `result` ack landing BEFORE the SRNE select
-	// entity echoes its new state: select_option acks successfully but the state
-	// cache is NOT updated, so the actuator's advisory read-back times out even
-	// though the write physically landed (the C1 double-spend hazard).
-	decoupleSelect bool
-
-	// selectEchoDelay models the SLOW SRNE state feed: a select_option write is
-	// acked immediately but only becomes visible in the state cache after this
-	// wall-clock delay. Used to prove the enter waits for UTI to APPLY before the
-	// amps write. Zero ⇒ immediate echo (unless decoupleSelect).
-	selectEchoDelay time.Duration
-	pendingSelEnt   string
-	pendingSelVal   string
-	pendingSelAt    time.Time
-
-	// dropFirstAmps models the SRNE dropping a rapid-fire consecutive write: the
-	// first set_value (amps) is acked but NOT reflected into the state cache.
-	dropFirstAmps bool
-	sawFirstAmps  bool
-
-	// dropAmps models a persistently-undeliverable amps write: EVERY set_value is
-	// acked but NEVER reflected, so the read-back never confirms (Fix 3 give-up).
-	dropAmps bool
+	// dropOnce[entity] = N: the next N writes to that entity are acked but NOT
+	// reflected into the state cache — modelling the SRNE dropping a rapid-fire
+	// consecutive write. Confirmation then fails until a retry lands.
+	dropOnce map[string]int
 
 	// panicNextCall makes the next CallServiceAck panic once (then clears),
-	// modelling a fault reaching the HA client mid-transition (H3 recovery).
+	// modelling a fault reaching the HA client mid-transition (panic recovery).
 	panicNextCall bool
 }
 
 func newFakeHA() *fakeHA {
 	return &fakeHA{
-		states:  map[string]string{},
-		attrs:   map[string]map[string]any{},
-		fresh:   map[string]bool{},
-		freshOK: true,
+		states:   map[string]string{},
+		attrs:    map[string]map[string]any{},
+		fresh:    map[string]bool{},
+		freshOK:  true,
+		dropOnce: map[string]int{},
 	}
 }
 
@@ -84,45 +64,26 @@ func (f *fakeHA) CallServiceAck(_ context.Context, domain, service string, data 
 		panic("fakeHA: injected panic in CallServiceAck")
 	}
 	defer f.mu.Unlock()
-	c := recordedCall{domain: domain, service: service}
-	if e, ok := data["entity_id"].(string); ok {
-		c.entity = e
-	}
-	if o, ok := data["option"].(string); ok {
-		c.option = o
-	}
-	if v, ok := data["value"].(float64); ok {
-		c.value = v
-	}
-	if service == "set_value" {
-		c.prioAtWrite = f.states[prioEntity]
-	}
-	f.calls = append(f.calls, c)
+	entity, _ := data["entity_id"].(string)
+	f.calls = append(f.calls, recordedCall{domain: domain, service: service, entity: entity, value: data["value"]})
 	if f.ackErr != nil {
 		return f.ackErr
 	}
-	// Reflect the write so read-back sees it — modelling the SRNE's echo behaviour.
+	if n := f.dropOnce[entity]; n > 0 {
+		f.dropOnce[entity] = n - 1
+		return nil // acked but not reflected (dropped)
+	}
 	switch service {
-	case "select_option":
-		switch {
-		case f.selectEchoDelay > 0:
-			// Slow feed: becomes visible only after selectEchoDelay (see State).
-			f.pendingSelEnt = c.entity
-			f.pendingSelVal = c.option
-			f.pendingSelAt = time.Now().Add(f.selectEchoDelay)
-		case f.decoupleSelect:
-			// Never echoes.
-		default:
-			f.states[c.entity] = c.option
-		}
+	case "turn_on":
+		f.states[entity] = switchOn
+	case "turn_off":
+		f.states[entity] = switchOff
 	case "set_value":
-		switch {
-		case f.dropAmps:
-			// Never reflected: read-back never confirms.
-		case f.dropFirstAmps && !f.sawFirstAmps:
-			f.sawFirstAmps = true // dropped: acked but not reflected
-		default:
-			f.states[c.entity] = strconv.FormatFloat(c.value, 'f', -1, 64)
+		switch v := data["value"].(type) {
+		case float64:
+			f.states[entity] = strconv.FormatFloat(v, 'f', -1, 64)
+		case string:
+			f.states[entity] = v
 		}
 	}
 	return nil
@@ -131,12 +92,6 @@ func (f *fakeHA) CallServiceAck(_ context.Context, domain, service string, data 
 func (f *fakeHA) State(entityID string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// Promote a delayed select echo once its wall-clock deadline has passed.
-	if f.pendingSelEnt == entityID && !f.pendingSelAt.IsZero() && !time.Now().Before(f.pendingSelAt) {
-		f.states[entityID] = f.pendingSelVal
-		f.pendingSelAt = time.Time{}
-		f.pendingSelEnt = ""
-	}
 	return f.states[entityID]
 }
 
@@ -166,43 +121,31 @@ func (f *fakeHA) setState(entityID, state string) {
 	f.states[entityID] = state
 }
 
-// selectCalls counts output_priority writes — each is one power blip.
-func (f *fakeHA) selectCalls(entity string) int {
+// --- recorded-call queries ---
+
+func (f *fakeHA) snapshot() []recordedCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return append([]recordedCall(nil), f.calls...)
+}
+
+func (f *fakeHA) totalCalls() int { return len(f.snapshot()) }
+
+// countService counts calls with the given service (across all entities).
+func (f *fakeHA) countService(service string) int {
 	n := 0
-	for _, c := range f.calls {
-		if c.service == "select_option" && c.entity == entity {
+	for _, c := range f.snapshot() {
+		if c.service == service {
 			n++
 		}
 	}
 	return n
 }
 
-func (f *fakeHA) lastSelect(entity string) string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	last := ""
-	for _, c := range f.calls {
-		if c.service == "select_option" && c.entity == entity {
-			last = c.option
-		}
-	}
-	return last
-}
-
-func (f *fakeHA) totalCalls() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.calls)
-}
-
-// ampsWriteCount counts set_value writes to the amps entity (each a retry/adjust).
-func (f *fakeHA) ampsWriteCount(entity string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+// countSet counts set_value writes to a specific entity.
+func (f *fakeHA) countSet(entity string) int {
 	n := 0
-	for _, c := range f.calls {
+	for _, c := range f.snapshot() {
 		if c.service == "set_value" && c.entity == entity {
 			n++
 		}
@@ -210,18 +153,19 @@ func (f *fakeHA) ampsWriteCount(entity string) int {
 	return n
 }
 
-// firstAmpsWritePrio returns the output_priority state visible at the moment the
-// FIRST amps write was issued — used to prove the enter gated the amps write on
-// UTI having applied.
-func (f *fakeHA) firstAmpsWritePrio(entity string) string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, c := range f.calls {
-		if c.service == "set_value" && c.entity == entity {
-			return c.prioAtWrite
+// lastIndexOf returns the index of the last matching call, or -1.
+func (f *fakeHA) lastIndexOf(match func(recordedCall) bool) int {
+	idx := -1
+	for i, c := range f.snapshot() {
+		if match(c) {
+			idx = i
 		}
 	}
-	return ""
+	return idx
+}
+
+func isSwitch(service string) func(recordedCall) bool {
+	return func(c recordedCall) bool { return c.service == service }
 }
 
 type fakeClock struct {
@@ -257,11 +201,11 @@ start = "11:00"
 end = "13:00"
 `
 
-func testRates(t *testing.T) *config.Rates {
+func parseRates(t *testing.T, tomlStr string) *config.Rates {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "c.toml")
-	if err := os.WriteFile(path, []byte(testTOML), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(tomlStr), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.Parse(path)
@@ -271,53 +215,70 @@ func testRates(t *testing.T) *config.Rates {
 	return &cfg.Rates
 }
 
+func testRates(t *testing.T) *config.Rates {
+	t.Helper()
+	return parseRates(t, testTOML)
+}
+
 const (
-	prioEntity = "select.out_prio"
-	ampsEntity = "number.mains_a"
-	voltEntity = "sensor.batt_v"
+	switchEntity = "switch.timed_charge"
+	ampsEntity   = "number.mains_a"
+	voltEntity   = "sensor.batt_v"
+	w1s          = "text.w1_start"
+	w1e          = "text.w1_end"
+	w2s          = "text.w2_start"
+	w2e          = "text.w2_end"
+	w3s          = "text.w3_start"
+	w3e          = "text.w3_end"
 )
 
 func testCfg(t *testing.T) config.ActuatorHW {
 	return config.ActuatorHW{
-		OutputPrioritySelect:     prioEntity,
+		TimedChargeSwitch:        switchEntity,
 		MainsChargeCurrentNumber: ampsEntity,
 		BatteryVoltageSensor:     voltEntity,
-		UtilityOption:            "UTI",
-		BatteryOption:            "SBU",
-		NumUnits:                 2,
-		MaxChargeCurrentA:        100,
-		StateDir:                 t.TempDir(),
-		WatchdogInterval:         config.Duration{Duration: time.Hour}, // won't fire mid-test
-		WriteTimeout:             config.Duration{Duration: time.Second},
-		ReadBackTimeout:          config.Duration{Duration: 150 * time.Millisecond}, // short: advisory read-back
-		VoltageStale:             config.Duration{Duration: 5 * time.Minute},
-		StateStale:               config.Duration{Duration: 5 * time.Minute},
+		ChargeWindows: []config.ChargeWindowEntities{
+			{Start: w1s, End: w1e},
+			{Start: w2s, End: w2e},
+			{Start: w3s, End: w3e},
+		},
+		NumUnits:          2,
+		MaxChargeCurrentA: 100,
+		StateDir:          t.TempDir(),
+		WindowInset:       config.Duration{Duration: 5 * time.Minute},
+		WatchdogInterval:  config.Duration{Duration: time.Hour}, // won't fire mid-test
+		WriteTimeout:      config.Duration{Duration: time.Second},
+		ReadBackTimeout:   config.Duration{Duration: 150 * time.Millisecond},
+		VoltageStale:      config.Duration{Duration: 5 * time.Minute},
+		StateStale:        config.Duration{Duration: 5 * time.Minute},
 	}
 }
 
-// inWindow is 02:00 Tokyo (inside 01:00-05:00); outWindow is 08:00 (peak).
+// seedWindows pre-populates the charge-window text entities with the mirrored,
+// INSET off-peak values (01:00-05:00 → 01:05-04:55, 11:00-13:00 → 11:05-12:55),
+// modelling the steady state after the rail has been established — so reconcile's
+// idempotent mirror is a no-op and tests observe a clean write count. Slot 3 has
+// no configured off-peak window, so it stays empty.
+func seedWindows(f *fakeHA) {
+	f.setState(w1s, "01:05")
+	f.setState(w1e, "04:55")
+	f.setState(w2s, "11:05")
+	f.setState(w2e, "12:55")
+}
+
+// inWindow is 02:00 Tokyo (inside 01:00-05:00); outWindow is 08:00 (peak);
+// window2 is 11:30 (inside 11:00-13:00).
 var (
 	tokyo, _  = time.LoadLocation("Asia/Tokyo")
 	inWindow  = time.Date(2026, 1, 15, 2, 0, 0, 0, tokyo)
 	outWindow = time.Date(2026, 1, 15, 8, 0, 0, 0, tokyo)
+	window2   = time.Date(2026, 1, 15, 11, 30, 0, 0, tokyo)
 )
 
-// newActuator builds a started actuator wired to a fake, with an injectable
-// clock. initialPriority seeds the inverter state seen by startup reconcile.
-func newActuator(t *testing.T, mode Mode, now time.Time, initialPriority string) (*Actuator, *fakeHA, *fakeClock) {
+// startWith wires an actuator to a pre-configured fake (seed windows / switch /
+// drops on it BEFORE calling), with an injectable clock and fast write knobs.
+func startWith(t *testing.T, fake *fakeHA, mode Mode, now time.Time) (*Actuator, *fakeClock) {
 	t.Helper()
-	return newActuatorTuned(t, mode, now, initialPriority, nil)
-}
-
-// newActuatorTuned is newActuator with a pre-Start hook to adjust loop-owned
-// knobs (e.g. settleTimeout) BEFORE the loop goroutine starts, so the mutation
-// never races the loop.
-func newActuatorTuned(t *testing.T, mode Mode, now time.Time, initialPriority string, tune func(*Actuator)) (*Actuator, *fakeHA, *fakeClock) {
-	t.Helper()
-	fake := newFakeHA()
-	if initialPriority != "" {
-		fake.setState(prioEntity, initialPriority)
-	}
 	clock := &fakeClock{t: now}
 	a, err := New(testCfg(t), config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, mode)
 	if err != nil {
@@ -325,37 +286,45 @@ func newActuatorTuned(t *testing.T, mode Mode, now time.Time, initialPriority st
 	}
 	a.now = clock.now
 	fastSettle(a)
-	if tune != nil {
-		tune(a)
-	}
 	if err := a.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(a.Close)
+	return a, clock
+}
+
+// newActuator builds a started actuator in the steady state (window rail already
+// mirrored). initialSwitch seeds the timed-charge switch state seen by reconcile.
+func newActuator(t *testing.T, mode Mode, now time.Time, initialSwitch string) (*Actuator, *fakeHA, *fakeClock) {
+	t.Helper()
+	fake := newFakeHA()
+	seedWindows(fake)
+	if initialSwitch != "" {
+		fake.setState(switchEntity, initialSwitch)
+	}
+	a, clock := startWith(t, fake, mode, now)
 	return a, fake, clock
 }
 
-// fastSettle shrinks the write-spacing knobs so the suite exercises the settle/
-// retry paths without real multi-second sleeps (production defaults are seconds).
-func fastSettle(a *Actuator) {
-	a.settleTimeout = 200 * time.Millisecond
-	a.settleDelay = time.Millisecond
-	a.settlePoll = 5 * time.Millisecond
+// rawActuator builds an unstarted actuator (no goroutines) for directly exercising
+// loop-owned methods like ensureWindowsMirrorOffPeak on the test goroutine.
+func rawActuator(t *testing.T, fake *fakeHA, rates *config.Rates, cfg config.ActuatorHW) *Actuator {
+	t.Helper()
+	a, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, rates, fake, ModeLive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastSettle(a)
+	return a
 }
 
-// waitAmpsSettled blocks until the async enter amps delivery has finished (or a
-// timeout). pendingActive is an atomic mirror of the loop-owned pending state, so
-// observing it false establishes a happens-before with the loop's final ep.amps
-// write — the test may then read a.ep / fake state race-free.
-func waitAmpsSettled(t *testing.T, a *Actuator) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for a.pendingActive.Load() {
-		if time.Now().After(deadline) {
-			t.Fatal("enter amps delivery did not settle within 2s")
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+// fastSettle shrinks the write-spacing/confirm knobs so the suite exercises the
+// spacing/retry paths without real multi-second sleeps (production defaults are
+// seconds).
+func fastSettle(a *Actuator) {
+	a.confirmTimeout = 200 * time.Millisecond
+	a.spacing = time.Millisecond
+	a.confirmPoll = 5 * time.Millisecond
 }
 
 func mustPlan(t *testing.T, a *Actuator, plan ChargePlan) {
@@ -376,241 +345,231 @@ func submitSync(t *testing.T, a *Actuator, c command) {
 	}
 }
 
-// --- state machine / blip budget ---
+// --- the static off-peak window rail ---
 
-func TestEnterAdjustStopExit_TwoBlips(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, ok := a.rates.ActiveWindow(inWindow)
-	if !ok {
-		t.Fatal("expected in-window")
-	}
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter (blip)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 3, Window: win}) // adjust (no blip)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 4, Window: win}) // adjust (no blip)
-	mustPlan(t, a, ChargePlan{Charging: false, Window: win})           // stop (no blip, stays bypass)
-	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID})     // exit (blip)
-
-	if got := fake.selectCalls(prioEntity); got != 2 {
-		t.Fatalf("want exactly 2 output_priority blips, got %d", got)
-	}
-	if last := fake.lastSelect(prioEntity); last != "SBU" {
-		t.Fatalf("want final priority SBU, got %q", last)
-	}
-}
-
-func TestAdjustsAreBlipFree(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 6, Window: win}) // enter
-	for _, kw := range []float64{5, 4, 3, 2, 1} {
-		mustPlan(t, a, ChargePlan{Charging: true, GridKW: kw, Window: win})
-	}
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("enter + 5 adjusts should be 1 blip, got %d", got)
-	}
-}
-
-func TestSecondEnterRefused(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter (blip 1)
-	// Simulate a mid-window fail-safe (e.g. a watchdog trip) that exits bypass
-	// but leaves the enter budget spent.
-	submitSync(t, a, command{kind: cmdSafe, reason: "test", force: true}) // exit (blip 2)
-
-	// A fresh charge request in the SAME window must be refused (budget spent),
-	// producing no third blip.
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if got := fake.selectCalls(prioEntity); got != 2 {
-		t.Fatalf("second enter must be refused; want 2 blips, got %d", got)
-	}
-}
-
-func TestNewWindowResetsBudget(t *testing.T) {
-	a, fake, clock := newActuator(t, ModeLive, inWindow, "SBU")
-	win1, _ := a.rates.ActiveWindow(inWindow)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win1}) // enter win1
-	submitSync(t, a, command{kind: cmdBoundary, windowID: win1.ID})     // exit win1 (2 blips)
-
-	// Advance to the next off-peak window (11:00) — a new occurrence, fresh budget.
-	next := time.Date(2026, 1, 15, 11, 30, 0, 0, tokyo)
-	clock.set(next)
-	win2, ok := a.rates.ActiveWindow(next)
-	if !ok || win2.ID == win1.ID {
-		t.Fatalf("expected a distinct second window, got ok=%v id=%s", ok, win2.ID)
-	}
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win2}) // enter win2 (blip 3)
-	if got := fake.selectCalls(prioEntity); got != 3 {
-		t.Fatalf("want 3 blips across two windows, got %d", got)
-	}
-}
-
-// --- boundary timer ---
-
-func TestBoundaryExitKeyedToWindow(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter
-
-	// A boundary for a DIFFERENT window must not exit.
-	submitSync(t, a, command{kind: cmdBoundary, windowID: "some-other-window"})
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("mismatched boundary must not exit; want 1 blip, got %d", got)
-	}
-	// The matching boundary exits.
-	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID})
-	if got := fake.selectCalls(prioEntity); got != 2 {
-		t.Fatalf("matching boundary must exit; want 2 blips, got %d", got)
-	}
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatal("boundary exit must set SBU")
-	}
-}
-
-// --- watchdog ---
-
-func TestWatchdogForcesSafeWhenStuckOutsideWindow(t *testing.T) {
-	a, fake, clock := newActuator(t, ModeLive, inWindow, "SBU")
-	// Move outside every off-peak window and pretend the inverter is stuck in UTI.
-	clock.set(outWindow)
-	fake.setState(prioEntity, "UTI")
-
-	submitSync(t, a, command{kind: cmdWatchdog})
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatal("watchdog must force SBU when UTI outside a window")
-	}
-}
-
-func TestWatchdogFailSafeOnStaleState(t *testing.T) {
-	a, fake, clock := newActuator(t, ModeLive, inWindow, "SBU")
-	// Enter bypass inside the window.
-	win, _ := a.rates.ActiveWindow(inWindow)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	before := fake.selectCalls(prioEntity)
-
-	// Now outside the window, feed goes stale (priority unknown) while our episode
-	// still believes we may be in bypass → fail-safe.
-	clock.set(outWindow)
+// TestReconcileMirrorsOffPeakWindows proves reconcile programs each charge-window
+// slot to STATICALLY mirror the configured off-peak period INSET by WindowInset
+// (5m: 01:00-05:00 → 01:05-04:55, 11:00-13:00 → 11:05-12:55), leaves a slot with
+// no corresponding window UNTOUCHED (never zeroed), and retries a dropped write.
+func TestReconcileMirrorsOffPeakWindows(t *testing.T) {
+	fake := newFakeHA()
+	fake.setState(switchEntity, switchOff)
 	fake.mu.Lock()
-	fake.fresh[prioEntity] = false
-	fake.states[prioEntity] = "unknown"
+	fake.dropOnce[w1s] = 1 // first window-1-start write dropped → must retry
 	fake.mu.Unlock()
 
-	submitSync(t, a, command{kind: cmdWatchdog})
-	if got := fake.selectCalls(prioEntity); got != before+1 || fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatalf("stale state outside window must fail-safe to SBU; blips %d→%d last=%s",
-			before, got, fake.lastSelect(prioEntity))
+	startWith(t, fake, ModeLive, inWindow)
+
+	if fake.State(w1s) != "01:05" || fake.State(w1e) != "04:55" {
+		t.Fatalf("slot 1 must mirror inset 01:05-04:55, got %q-%q", fake.State(w1s), fake.State(w1e))
+	}
+	if fake.State(w2s) != "11:05" || fake.State(w2e) != "12:55" {
+		t.Fatalf("slot 2 must mirror inset 11:05-12:55, got %q-%q", fake.State(w2s), fake.State(w2e))
+	}
+	// Slot 3 has no configured off-peak window → left untouched (never zeroed).
+	if fake.State(w3s) != "" || fake.State(w3e) != "" {
+		t.Fatalf("slot 3 must be left untouched, got %q-%q", fake.State(w3s), fake.State(w3e))
+	}
+	if fake.countSet(w1s) < 2 {
+		t.Fatalf("dropped window write must be retried (>=2 writes), got %d", fake.countSet(w1s))
 	}
 }
 
-func TestWatchdogQuietWhenHealthyInWindow(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // legitimately in bypass
-	before := fake.selectCalls(prioEntity)
-
-	submitSync(t, a, command{kind: cmdWatchdog}) // in-window UTI is expected
-	if got := fake.selectCalls(prioEntity); got != before {
-		t.Fatalf("watchdog must not fire in-window; blips %d→%d", before, got)
+// TestSteadyStateStartupNoWrites proves that when the windows already mirror
+// off-peak and the switch is off, startup issues zero writes (idempotent rail).
+func TestSteadyStateStartupNoWrites(t *testing.T) {
+	_, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	if got := fake.totalCalls(); got != 0 {
+		t.Fatalf("steady-state startup must be zero-write, got %d", got)
 	}
 }
 
-// --- Close safes the hardware ---
+// --- start: current + enable-last, no window rewriting ---
 
-func TestCloseSafesHardware(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // in bypass
+// TestStartSetsCurrentEnablesLast proves a fresh charge sets the per-unit current
+// and enables timed charge LAST (after the current), and does NOT rewrite the
+// static window rail.
+func TestStartSetsCurrentEnablesLast(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
 
-	a.Close()
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatal("Close must force SBU when in bypass")
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatalf("mains charge current must be set nonzero, got %v", v)
+	}
+	if fake.State(switchEntity) != switchOn {
+		t.Fatal("timed charge must be enabled after a start")
+	}
+	enableIdx := fake.lastIndexOf(isSwitch("turn_on"))
+	if enableIdx != fake.totalCalls()-1 {
+		t.Fatalf("enable must be the LAST write; enable at %d of %d calls", enableIdx, fake.totalCalls())
+	}
+	currentIdx := fake.lastIndexOf(func(c recordedCall) bool { return c.service == "set_value" && c.entity == ampsEntity })
+	if enableIdx <= currentIdx {
+		t.Fatalf("enable (idx %d) must follow the current write (%d)", enableIdx, currentIdx)
+	}
+	for _, e := range []string{w1s, w1e, w2s, w2e, w3s, w3e} {
+		if fake.countSet(e) != 0 {
+			t.Fatalf("start must not rewrite the static window rail; %s written %d times", e, fake.countSet(e))
+		}
+	}
+	if !a.st.charging {
+		t.Fatal("state must record charging after a confirmed enable")
 	}
 }
 
-// --- startup reconciliation ---
+// TestSecondWindowChargesWithoutRewritingWindows proves charging in the second
+// off-peak window works off the pre-mirrored rail (global switch), with NO window
+// writes — the whole point of the static-mirror model.
+func TestSecondWindowChargesWithoutRewritingWindows(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, window2, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
 
-func TestReconcileAdoptsOpenBypassInWindow(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "UTI") // already in bypass, in window
-	// Adoption must NOT blip (the enter was already spent before we started).
-	if got := fake.selectCalls(prioEntity); got != 0 {
-		t.Fatalf("adopt must not blip, got %d select calls", got)
+	if fake.State(switchEntity) != switchOn {
+		t.Fatal("must charge in the second off-peak window")
 	}
-	if !a.ep.inBypass || !a.ep.entered {
-		t.Fatalf("expected adopted open episode, got %+v", a.ep)
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatalf("current must be set in window 2, got %v", v)
 	}
-	// A boundary exit for the adopted window produces exactly one (exit) blip.
-	win, _ := a.rates.ActiveWindow(inWindow)
-	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID})
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("want 1 exit blip after adopt, got %d", got)
+	for _, e := range []string{w1s, w1e, w2s, w2e} {
+		if fake.countSet(e) != 0 {
+			t.Fatalf("charging in window 2 must not rewrite the static windows; %s written", e)
+		}
 	}
 }
 
-func TestReconcileSafesUTIOutsideWindow(t *testing.T) {
-	_, fake, _ := newActuator(t, ModeLive, outWindow, "UTI") // UTI but peak → unsafe
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatal("startup must fail-safe UTI-outside-window to SBU")
+// TestAdjustsAreCheap proves a start followed by rate changes enables timed charge
+// exactly ONCE (no re-enable) and never touches the windows.
+func TestAdjustsAreCheap(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 6})
+	for _, kw := range []float64{5, 4, 3, 2, 1} {
+		mustPlan(t, a, ChargePlan{Charging: true, GridKW: kw})
+	}
+	if got := fake.countService("turn_on"); got != 1 {
+		t.Fatalf("start + 5 adjusts must enable timed charge once, got %d", got)
+	}
+	for _, e := range []string{w1s, w1e, w2s, w2e, w3s, w3e} {
+		if fake.countSet(e) != 0 {
+			t.Fatalf("adjusts must not touch the windows; %s written", e)
+		}
+	}
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatalf("current must remain set during adjusts, got %v", v)
 	}
 }
 
-func TestReconcilePreservesBudgetAcrossRestart(t *testing.T) {
-	dir := t.TempDir()
-	cfg := testCfg(t)
-	cfg.StateDir = dir
-	rates := testRates(t)
-	win, _ := rates.ActiveWindow(inWindow)
+// --- stop: disable-first, clears state, never touches windows ---
 
-	// First actuator: enter then exit within the window (budget spent), then close.
-	fake1 := newFakeHA()
-	fake1.setState(prioEntity, "SBU")
-	a1, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, rates, fake1, ModeLive)
-	if err != nil {
-		t.Fatal(err)
+// TestStopDisablesFirstThenZerosCurrent proves stopping disables the switch
+// BEFORE zeroing the current, clears the charge state, and never touches windows.
+func TestStopDisablesFirstThenZerosCurrent(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5}) // charging
+	if !a.st.charging {
+		t.Fatal("precondition: must be charging")
 	}
-	a1.now = func() time.Time { return inWindow }
-	fastSettle(a1)
-	if err := a1.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	mustPlan(t, a1, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	submitSync(t, a1, command{kind: cmdBoundary, windowID: win.ID})
-	a1.Close()
+	before := fake.totalCalls()
 
-	// Second actuator restarts mid-window (priority now SBU) — the persisted budget
-	// must forbid a fresh enter in the same window.
-	fake2 := newFakeHA()
-	fake2.setState(prioEntity, "SBU")
-	a2, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, rates, fake2, ModeLive)
-	if err != nil {
-		t.Fatal(err)
+	mustPlan(t, a, ChargePlan{Charging: false}) // stop
+
+	disableIdx := fake.lastIndexOf(isSwitch("turn_off"))
+	zeroIdx := fake.lastIndexOf(func(c recordedCall) bool {
+		v, _ := c.value.(float64)
+		return c.service == "set_value" && c.entity == ampsEntity && v == 0
+	})
+	if disableIdx < before {
+		t.Fatal("stop must issue a turn_off")
 	}
-	a2.now = func() time.Time { return inWindow }
-	fastSettle(a2)
-	if err := a2.Start(context.Background()); err != nil {
-		t.Fatal(err)
+	if zeroIdx < before || disableIdx >= zeroIdx {
+		t.Fatalf("disable (idx %d) must precede zero-current (idx %d)", disableIdx, zeroIdx)
 	}
-	t.Cleanup(a2.Close)
-	mustPlan(t, a2, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if got := fake2.selectCalls(prioEntity); got != 0 {
-		t.Fatalf("restart must not re-enter same spent window; got %d blips", got)
+	if fake.State(switchEntity) != switchOff {
+		t.Fatal("stop must leave timed charge off")
+	}
+	if fake.StateFloat(ampsEntity) != 0 {
+		t.Fatal("stop must zero the current")
+	}
+	for _, e := range []string{w1s, w1e, w2s, w2e, w3s, w3e} {
+		if fake.countSet(e) != 0 {
+			t.Fatalf("stop must NEVER touch the windows; %s written", e)
+		}
+	}
+	if a.st.charging {
+		t.Fatal("stop must clear the charging state")
+	}
+}
+
+// TestStopWhenIdleIsNoOp proves a not-charging plan while already stopped issues
+// no writes (idempotent).
+func TestStopWhenIdleIsNoOp(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: false})
+	if got := fake.totalCalls(); got != 0 {
+		t.Fatalf("idle stop must issue zero writes, got %d", got)
+	}
+}
+
+// --- write spacing + retry-until-confirmed ---
+
+// TestDroppedCurrentAndSwitchRetried proves a dropped current / enable write is
+// retried (spaced) within the same command and lands.
+func TestDroppedCurrentAndSwitchRetried(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.mu.Lock()
+	fake.dropOnce[ampsEntity] = 1
+	fake.dropOnce[switchEntity] = 1
+	fake.mu.Unlock()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatalf("dropped current write must be retried and land; got %v", v)
+	}
+	if fake.State(switchEntity) != switchOn {
+		t.Fatal("dropped enable write must be retried and land")
+	}
+	if fake.countSet(ampsEntity) < 2 {
+		t.Fatalf("dropped current write must be retried at least once, got %d", fake.countSet(ampsEntity))
+	}
+	if got := fake.countService("turn_on"); got < 2 {
+		t.Fatalf("dropped enable must be retried at least once, got %d turn_on", got)
+	}
+}
+
+// TestUnconfirmedEnableLeavesNotCharging proves that when the enable never
+// confirms, the actuator does NOT record charging, so the next tick retries.
+func TestUnconfirmedEnableLeavesNotCharging(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.mu.Lock()
+	fake.dropOnce[switchEntity] = 1000 // enable never reflects
+	fake.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.SetChargePlan(ctx, ChargePlan{Charging: true, GridKW: 5}); err == nil {
+		t.Fatal("an unconfirmed enable must surface an error")
+	}
+	if a.st.charging {
+		t.Fatal("unconfirmed enable must not record charging (so the next tick retries)")
+	}
+	// Current was still set (safe — switch is off, nothing charges).
+	if v := fake.StateFloat(ampsEntity); v <= 0 {
+		t.Fatal("current must still be set even when the enable fails")
 	}
 }
 
 // --- mode gating ---
 
 func TestObserveModeWritesNothing(t *testing.T) {
-	a, fake, clock := newActuator(t, ModeObserve, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID})
+	a, fake, clock := newActuator(t, ModeObserve, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+	mustPlan(t, a, ChargePlan{Charging: false})
 
 	// Even a watchdog trigger must not write in observe mode.
 	clock.set(outWindow)
-	fake.setState(prioEntity, "UTI")
+	fake.setState(switchEntity, switchOn)
 	submitSync(t, a, command{kind: cmdWatchdog})
 
 	if got := fake.totalCalls(); got != 0 {
@@ -619,20 +578,118 @@ func TestObserveModeWritesNothing(t *testing.T) {
 }
 
 func TestWatchdogOnlyModeOnlySafes(t *testing.T) {
-	a, fake, clock := newActuator(t, ModeWatchdogOnly, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
+	a, fake, clock := newActuator(t, ModeWatchdogOnly, inWindow, switchOff)
 
-	// Policy must not actuate.
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if got := fake.totalCalls(); got != 0 {
-		t.Fatalf("watchdog-only must not run policy writes, got %d", got)
+	// Policy must not actuate (never initiates charging).
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+	if got := fake.countService("turn_on"); got != 0 {
+		t.Fatalf("watchdog-only must not enable timed charge, got %d turn_on", got)
 	}
-	// But the safing path may write.
+	// But the fail-safe path may write: timed charge left on outside a window.
 	clock.set(outWindow)
-	fake.setState(prioEntity, "UTI")
+	fake.setState(switchEntity, switchOn)
 	submitSync(t, a, command{kind: cmdWatchdog})
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatal("watchdog-only must still fail-safe to SBU")
+	if fake.State(switchEntity) != switchOff {
+		t.Fatal("watchdog-only must still disable timed charge outside a window")
+	}
+}
+
+// --- watchdog: out-of-window backstop ---
+
+func TestWatchdogDisablesTimedChargeOutsideWindow(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	clock.set(outWindow)
+	fake.setState(switchEntity, switchOn)
+
+	submitSync(t, a, command{kind: cmdWatchdog})
+	if fake.State(switchEntity) != switchOff {
+		t.Fatal("watchdog must disable timed charge enabled outside a window")
+	}
+}
+
+func TestWatchdogDisablesOnStaleFeedOutsideWindow(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	clock.set(outWindow)
+	fake.mu.Lock()
+	fake.fresh[switchEntity] = false
+	fake.states[switchEntity] = "unknown"
+	fake.mu.Unlock()
+
+	submitSync(t, a, command{kind: cmdWatchdog})
+	if fake.State(switchEntity) != switchOff {
+		t.Fatalf("stale feed outside a window must disable timed charge; got %q", fake.State(switchEntity))
+	}
+}
+
+func TestWatchdogQuietWhenOffOutsideWindow(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	clock.set(outWindow) // outside a window, switch already off
+	before := fake.totalCalls()
+	submitSync(t, a, command{kind: cmdWatchdog})
+	if got := fake.totalCalls(); got != before {
+		t.Fatalf("watchdog must be quiet when off outside a window; writes %d→%d", before, got)
+	}
+}
+
+func TestWatchdogQuietInWindow(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5}) // legitimately charging in-window
+	before := fake.totalCalls()
+
+	submitSync(t, a, command{kind: cmdWatchdog}) // in-window: policy governs, watchdog stays quiet
+	if got := fake.totalCalls(); got != before {
+		t.Fatalf("watchdog must not act in-window; writes %d→%d", before, got)
+	}
+	if fake.State(switchEntity) != switchOn {
+		t.Fatal("watchdog must not disable a legitimate in-window charge")
+	}
+}
+
+// TestWatchdogReassertsWindowMirror proves the watchdog idempotently re-asserts
+// the static window rail, self-healing a mid-life window scramble.
+func TestWatchdogReassertsWindowMirror(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.setState(w1s, "09:00") // a mid-life window corruption
+
+	submitSync(t, a, command{kind: cmdWatchdog})
+
+	if got := fake.State(w1s); got != "01:05" {
+		t.Fatalf("watchdog must re-assert the mirrored window; w1s=%q want 01:05", got)
+	}
+}
+
+// --- Close disables timed charge ---
+
+func TestCloseDisablesTimedCharge(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5}) // charging
+
+	a.Close()
+	if fake.State(switchEntity) != switchOff {
+		t.Fatal("Close must disable timed charge")
+	}
+	if fake.StateFloat(ampsEntity) != 0 {
+		t.Fatal("Close must zero the current")
+	}
+}
+
+// --- startup reconciliation ---
+
+func TestReconcileDisablesTimedChargeFoundOn(t *testing.T) {
+	// Switch found ON at startup (a crashed-daemon leftover) → reconcile disables.
+	_, fake, _ := newActuator(t, ModeLive, inWindow, switchOn)
+	if fake.State(switchEntity) != switchOff {
+		t.Fatal("startup reconcile must disable a timed charge found enabled")
+	}
+	if got := fake.countService("turn_off"); got < 1 {
+		t.Fatalf("reconcile must issue a disable when found on, got %d turn_off", got)
+	}
+}
+
+func TestReconcileObserveModeDoesNotWrite(t *testing.T) {
+	_, fake, _ := newActuator(t, ModeObserve, inWindow, switchOn)
+	if got := fake.totalCalls(); got != 0 {
+		t.Fatalf("observe-mode reconcile must not write even if found on, got %d", got)
 	}
 }
 
@@ -645,20 +702,20 @@ func TestKwToAmps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Fresh live voltage is used.
+	// Fresh live voltage is used (per-unit = kW*1000/(V*numUnits), numUnits=2).
 	fake.setState(voltEntity, "50.0")
 	fake.fresh[voltEntity] = true
-	if got := a.kwToAmps(5.28); !approx(got, 5280/(50.0*2)) { // 52.8
+	if got := a.kwToAmps(5.28); !approx(got, 5280/(50.0*2)) {
 		t.Fatalf("live-voltage amps: got %.3f", got)
 	}
 
 	// Stale voltage falls back to nominal (52.8).
 	fake.fresh[voltEntity] = false
-	if got := a.kwToAmps(5.28); !approx(got, 5280/(52.8*2)) { // 50.0
+	if got := a.kwToAmps(5.28); !approx(got, 5280/(52.8*2)) {
 		t.Fatalf("nominal-fallback amps: got %.3f", got)
 	}
 
-	// Clamp to the ceiling.
+	// Clamp to the per-unit ceiling.
 	fake.fresh[voltEntity] = false
 	if got := a.kwToAmps(1000); got != a.cfg.MaxChargeCurrentA {
 		t.Fatalf("clamp: got %.3f want %.1f", got, a.cfg.MaxChargeCurrentA)
@@ -678,140 +735,204 @@ func approx(a, b float64) bool {
 	return d < 1e-6
 }
 
-func TestEnterWriteFailureEscalatesToSafe(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-	fake.ackErr = errors.New("boom") // every write now fails ack
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := a.SetChargePlan(ctx, ChargePlan{Charging: true, GridKW: 5, Window: win}); err == nil {
-		t.Fatal("expected enter to error when writes fail")
-	}
-	// The priority ack failed, so no blip occurred and the enter budget is NOT
-	// spent: the episode must not believe it is in bypass, and no fail-safe blip is
-	// issued on the (unconfirmed) enter.
-	if a.ep.inBypass {
-		t.Fatal("failed enter must not leave inBypass set")
-	}
-	if a.ep.entered {
-		t.Fatal("failed enter (ack rejected) must not spend the enter budget")
-	}
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("failed enter must attempt exactly one (failed) UTI write, no safe blip; got %d", got)
-	}
-}
-
-// --- C1: enter-blip spent on ACK, not read-back (the make-or-break invariant) ---
-
-// TestC1EnterBlipSpentOnAckNotReadBack proves that when the output_priority
-// service ack lands but the state echo is DELAYED beyond read_back_timeout (the
-// SRNE select entity's state_changed lag), the actuator (a) counts the enter as
-// spent — entered=true, inBypass=true — after exactly ONE output_priority write,
-// and (b) does NOT re-enter or fail-safe on the next charging tick in the same
-// window. The pre-fix code marked entered only after a successful read-back, so a
-// timed-out echo produced a spurious safe blip + a re-enter next tick (unbounded).
-func TestC1EnterBlipSpentOnAckNotReadBack(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	// Ack succeeds but the select entity never echoes its new UTI state → the
-	// advisory read-back times out (150ms) even though the write physically landed.
-	fake.mu.Lock()
-	fake.decoupleSelect = true
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("enter must be exactly ONE output_priority write despite read-back timeout, got %d", got)
-	}
-	if !a.ep.entered || !a.ep.inBypass {
-		t.Fatalf("ack acceptance must spend the enter-blip: entered=%v inBypass=%v", a.ep.entered, a.ep.inBypass)
+// TestKwToAmpsAggregateCeilingAndLowVoltage checks the aggregate-kW clamp applies
+// BEFORE the kW→A conversion, and that an implausibly-low fresh voltage falls back
+// to nominal instead of inflating amps.
+func TestKwToAmpsAggregateCeilingAndLowVoltage(t *testing.T) {
+	fake := newFakeHA()
+	cfg := testCfg(t)
+	cfg.MaxChargeKW = 8
+	a, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, ModeLive)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Next charging tick in the SAME window: no re-enter, no spurious safe → still
-	// exactly one output_priority write total.
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("no double-spend: same-window tick must issue ZERO further output_priority writes, got %d total", got)
+	fake.setState(voltEntity, "52.8")
+	fake.fresh[voltEntity] = true
+	got := a.kwToAmps(20) // clamps to 8 kW first → 8000/(52.8*2) ≈ 75.8 A, under the 100 A per-unit ceiling
+	want := 8 * 1000.0 / (52.8 * 2)
+	if !approx(got, want) {
+		t.Fatalf("aggregate ceiling: got %.3f want %.3f", got, want)
 	}
-	// The last write was the UTI enter (never reversed to SBU).
-	if last := fake.lastSelect(prioEntity); last != "UTI" {
-		t.Fatalf("must remain in UTI (no reversing safe), last select was %q", last)
+
+	fake.setState(voltEntity, "5.0") // glitched-low fresh voltage → use nominal
+	fake.fresh[voltEntity] = true
+	got = a.kwToAmps(5)
+	want = 5 * 1000.0 / (52.8 * 2)
+	if !approx(got, want) {
+		t.Fatalf("low-voltage guard: got %.3f want %.3f", got, want)
 	}
 }
 
-// --- H2: stale-feed watchdog blind spot (no ep.inBypass gate) ---
+// --- zero grid charge ---
 
-// TestWatchdogFailSafeStalePhysicalUTIEpNotInBypass covers a stale feed outside
-// any window while the hardware is physically UTI but ep.inBypass is false (a
-// failed/ambiguous enter). The watchdog must still force SBU. Pre-fix, the
-// `&& a.ep.inBypass` gate left it stranded.
-func TestWatchdogFailSafeStalePhysicalUTIEpNotInBypass(t *testing.T) {
-	a, fake, clock := newActuator(t, ModeLive, inWindow, "SBU")
-	if a.ep.inBypass {
-		t.Fatal("precondition: ep.inBypass must be false (never entered)")
+// TestZeroGridChargeEnsuresOff asserts a charge plan whose grid share rounds to
+// ~0 A (PV surplus covers it) does NOT enable timed charge.
+func TestZeroGridChargeEnsuresOff(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 0})
+	if got := fake.countService("turn_on"); got != 0 {
+		t.Fatalf("zero grid-charge must not enable timed charge; got %d turn_on", got)
 	}
-	// Outside every window; feed goes stale (priority unknown) — hardware may be UTI.
-	clock.set(outWindow)
-	fake.mu.Lock()
-	fake.fresh[prioEntity] = false
-	fake.states[prioEntity] = "unknown"
-	fake.mu.Unlock()
-
-	submitSync(t, a, command{kind: cmdWatchdog})
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatalf("stale feed outside window with ep.inBypass=false must force SBU; last=%q",
-			fake.lastSelect(prioEntity))
+	if a.st.charging {
+		t.Fatal("zero grid-charge must not record charging")
 	}
 }
 
-// --- H3: panic recovery in the command path forces safe ---
+// --- the off-peak hardware rail ---
 
-// TestPanicInTransitionRecoveredAndSafes injects a panic mid-enter (the HA client
-// panics on the first service call). The handler must recover, force a best-effort
-// safe to SBU, return an error, and keep the goroutine alive for later commands.
+// TestWindowWithinOffPeakRail unit-tests the rail guard on what is written to a
+// charge-window slot: a configured off-peak window passes; a peak-spanning or a
+// fully-peak window fails.
+func TestWindowWithinOffPeakRail(t *testing.T) {
+	a, _, _ := newActuator(t, ModeLive, inWindow, switchOff)
+
+	if !a.windowWithinOffPeak(config.TimeWindow{Start: config.TimeOfDay{Hour: 1}, End: config.TimeOfDay{Hour: 5}}) {
+		t.Fatal("a configured off-peak window must pass the rail")
+	}
+	if a.windowWithinOffPeak(config.TimeWindow{Start: config.TimeOfDay{Hour: 2}, End: config.TimeOfDay{Hour: 8}}) {
+		t.Fatal("a peak-spanning window (02:00-08:00) must FAIL the rail")
+	}
+	if a.windowWithinOffPeak(config.TimeWindow{Start: config.TimeOfDay{Hour: 6}, End: config.TimeOfDay{Hour: 7}}) {
+		t.Fatal("a fully-peak window (06:00-07:00) must FAIL the rail")
+	}
+}
+
+// TestInsetWindow unit-tests the window-inset helper: normal shrink at both ends,
+// rejection of a window shorter than 2×inset, and zero-inset passthrough.
+func TestInsetWindow(t *testing.T) {
+	tw := func(sh, sm, eh, em int) config.TimeWindow {
+		return config.TimeWindow{Start: config.TimeOfDay{Hour: sh, Minute: sm}, End: config.TimeOfDay{Hour: eh, Minute: em}}
+	}
+	if got, ok := insetWindow(tw(1, 0, 5, 0), 5*time.Minute); !ok ||
+		got.Start != (config.TimeOfDay{Hour: 1, Minute: 5}) || got.End != (config.TimeOfDay{Hour: 4, Minute: 55}) {
+		t.Fatalf("inset 01:00-05:00 → 01:05-04:55, got %v-%v ok=%v", got.Start, got.End, ok)
+	}
+	if got, ok := insetWindow(tw(11, 0, 13, 0), 5*time.Minute); !ok ||
+		got.Start != (config.TimeOfDay{Hour: 11, Minute: 5}) || got.End != (config.TimeOfDay{Hour: 12, Minute: 55}) {
+		t.Fatalf("inset 11:00-13:00 → 11:05-12:55, got %v-%v ok=%v", got.Start, got.End, ok)
+	}
+	if _, ok := insetWindow(tw(2, 0, 2, 8), 5*time.Minute); ok {
+		t.Fatal("an 8-min window with 5-min inset must be rejected (< 2×inset)")
+	}
+	if got, ok := insetWindow(tw(1, 0, 5, 0), 0); !ok || got.Start != (config.TimeOfDay{Hour: 1}) {
+		t.Fatalf("zero inset must pass through unchanged, got %v ok=%v", got, ok)
+	}
+}
+
+// TestMirrorSkipsShortWindow proves an off-peak window shorter than 2×inset is
+// skipped (not written) rather than programmed with a collapsed/inverted window.
+func TestMirrorSkipsShortWindow(t *testing.T) {
+	const shortTOML = `
+time_zone = "Asia/Tokyo"
+[rates]
+peak_rate = 30
+off_peak_rate = 10
+feed_in_rate = 0
+[[rates.off_peak_windows]]
+start = "02:00"
+end = "02:08"
+`
+	fake := newFakeHA()
+	a := rawActuator(t, fake, parseRates(t, shortTOML), testCfg(t))
+	wrote, err := a.ensureWindowsMirrorOffPeak()
+	if err != nil {
+		t.Fatalf("mirror should not error, got %v", err)
+	}
+	if wrote {
+		t.Fatal("a sub-2×inset window must be skipped (no write)")
+	}
+	if fake.State(w1s) != "" || fake.State(w1e) != "" {
+		t.Fatalf("short window slot must be left untouched, got %q-%q", fake.State(w1s), fake.State(w1e))
+	}
+}
+
+// TestMirrorSkipsMidnightBound proves a mirrored window whose inset bound lands on
+// 00:00 (which the inverter may misread as a wrap/zero window) is skipped.
+func TestMirrorSkipsMidnightBound(t *testing.T) {
+	// 23:55-04:00 inset by 5m → start 00:00 (midnight) → must skip.
+	const midnightTOML = `
+time_zone = "Asia/Tokyo"
+[rates]
+peak_rate = 30
+off_peak_rate = 10
+feed_in_rate = 0
+[[rates.off_peak_windows]]
+start = "23:55"
+end = "04:00"
+`
+	fake := newFakeHA()
+	a := rawActuator(t, fake, parseRates(t, midnightTOML), testCfg(t))
+	wrote, err := a.ensureWindowsMirrorOffPeak()
+	if err != nil {
+		t.Fatalf("mirror should not error, got %v", err)
+	}
+	if wrote {
+		t.Fatal("a window with a 00:00 mirrored bound must be skipped (no write)")
+	}
+	if fake.State(w1s) != "" || fake.State(w1e) != "" {
+		t.Fatalf("midnight-bound slot must be left untouched, got %q-%q", fake.State(w1s), fake.State(w1e))
+	}
+}
+
+// TestNoChargeAtPeakEnsuresOff proves that a charging plan arriving while the
+// clock is at peak (a buggy caller) never enables timed charge — the actuator
+// derives off-peak from its own tariff config.
+func TestNoChargeAtPeakEnsuresOff(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, outWindow, switchOff) // clock at peak (08:00)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+	if got := fake.countService("turn_on"); got != 0 {
+		t.Fatalf("charge at peak must not enable timed charge; got %d turn_on", got)
+	}
+	if a.st.charging {
+		t.Fatal("charge at peak must not record charging")
+	}
+}
+
+// --- panic recovery ---
+
+// TestPanicInTransitionRecoveredAndSafes injects a panic mid-start; the handler
+// must recover, best-effort disable timed charge, return an error, and keep the
+// goroutine alive for later commands.
 func TestPanicInTransitionRecoveredAndSafes(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
 
 	fake.mu.Lock()
-	fake.panicNextCall = true // the enter's UTI write panics
+	fake.panicNextCall = true // the first write panics
 	fake.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := a.SetChargePlan(ctx, ChargePlan{Charging: true, GridKW: 5, Window: win}); err == nil {
+	if err := a.SetChargePlan(ctx, ChargePlan{Charging: true, GridKW: 5}); err == nil {
 		t.Fatal("a recovered panic must surface as an error to the caller")
 	}
-	// Recovery forced a safe: final priority is SBU and we are not in bypass.
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatalf("panic recovery must force SBU; last select=%q", fake.lastSelect(prioEntity))
+	if fake.State(switchEntity) != switchOff {
+		t.Fatalf("panic recovery must disable timed charge; switch=%q", fake.State(switchEntity))
 	}
-	if a.ep.inBypass {
-		t.Fatal("panic recovery safe must clear inBypass")
+	if a.st.charging {
+		t.Fatal("panic recovery must leave charging cleared")
 	}
 	// The goroutine survived: a subsequent command is still served.
 	submitSync(t, a, command{kind: cmdWatchdog})
 }
 
-// --- M5: atomic persist ---
+// --- persistence ---
 
 // TestPersistAtomicAndCorruptColdStart verifies (a) a corrupt persisted file
-// cold-starts cleanly (no crash, no lost distinction) and (b) persist leaves no
-// torn temp files and writes valid JSON via temp+rename.
+// cold-starts cleanly and (b) persist leaves no torn temp files and writes valid
+// JSON via temp+rename.
 func TestPersistAtomicAndCorruptColdStart(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testCfg(t)
 	cfg.StateDir = dir
-	path := filepath.Join(dir, "actuator_episode.json")
+	path := filepath.Join(dir, "actuator_charge.json")
 
-	// (a) A corrupt existing file must not crash load, and must cold-start clean.
 	if err := os.WriteFile(path, []byte("{ this is not valid json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	fake := newFakeHA()
-	fake.setState(prioEntity, "SBU")
+	seedWindows(fake)
+	fake.setState(switchEntity, switchOff)
 	a, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, ModeLive)
 	if err != nil {
 		t.Fatal(err)
@@ -822,21 +943,18 @@ func TestPersistAtomicAndCorruptColdStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(a.Close)
-	if a.ep.windowID != "" || a.ep.entered || a.ep.inBypass {
-		t.Fatalf("corrupt persisted file must cold-start clean, got %+v", a.ep)
+	if a.st.charging {
+		t.Fatalf("corrupt persisted file must cold-start clean, got %+v", a.st)
 	}
 
-	// (b) Enter (persists), then assert no leftover temp files and a valid file.
-	win, _ := a.rates.ActiveWindow(inWindow)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	waitAmpsSettled(t, a)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".actuator-episode-") {
+		if strings.HasPrefix(e.Name(), ".actuator-charge-") {
 			t.Fatalf("atomic write must not leave a temp file, found %s", e.Name())
 		}
 	}
@@ -848,333 +966,23 @@ func TestPersistAtomicAndCorruptColdStart(t *testing.T) {
 	if err := json.Unmarshal(data, &ps); err != nil {
 		t.Fatalf("persisted file must be valid JSON (not torn): %v", err)
 	}
-	if !ps.Entered || !ps.InBypass {
-		t.Fatalf("persisted budget after enter must record entered+inBypass, got %+v", ps)
+	if !ps.Charging {
+		t.Fatalf("persisted state after a start must record charging, got %+v", ps)
 	}
 }
 
-// --- M6: aggregate-kW ceiling + low-voltage guard ---
+// TestEnterWriteFailureSurfaces proves a failing ack surfaces as an error and does
+// not record charging.
+func TestEnterWriteFailureSurfaces(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.ackErr = errors.New("boom") // every write now fails ack
 
-// TestKwToAmpsAggregateCeilingAndLowVoltage checks the aggregate-kW clamp applies
-// BEFORE the kW→A conversion (so >8kW never reaches the per-unit ceiling) and that
-// an implausibly-low fresh voltage falls back to nominal instead of inflating amps.
-func TestKwToAmpsAggregateCeilingAndLowVoltage(t *testing.T) {
-	fake := newFakeHA()
-	cfg := testCfg(t)
-	cfg.MaxChargeKW = 8
-	a, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, ModeLive)
-	if err != nil {
-		t.Fatal(err)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.SetChargePlan(ctx, ChargePlan{Charging: true, GridKW: 5}); err == nil {
+		t.Fatal("expected start to error when writes fail")
 	}
-
-	// A 20 kW ask clamps to 8 kW first → 8000/(52.8*2) ≈ 75.8 A, WELL under the
-	// per-unit 100 A ceiling (so we can tell the aggregate clamp bit, not the amps
-	// clamp: without it, 20 kW would saturate to 100 A).
-	fake.setState(voltEntity, "52.8")
-	fake.fresh[voltEntity] = true
-	got := a.kwToAmps(20)
-	want := 8 * 1000.0 / (52.8 * 2)
-	if !approx(got, want) {
-		t.Fatalf("aggregate ceiling: got %.3f want %.3f (per-unit clamp would give %.1f)",
-			got, want, a.cfg.MaxChargeCurrentA)
-	}
-
-	// A glitched-low fresh voltage (5 V) must use nominal (52.8), not inflate amps.
-	fake.setState(voltEntity, "5.0")
-	fake.fresh[voltEntity] = true
-	got = a.kwToAmps(5)
-	want = 5 * 1000.0 / (52.8 * 2)
-	if !approx(got, want) {
-		t.Fatalf("low-voltage guard: got %.3f want %.3f (5 V would give ~500 A → clamp 100)", got, want)
-	}
-}
-
-// --- L7: never enter bypass to charge zero ---
-
-// TestNoEnterForZeroGridCharge asserts that a charge plan whose grid share rounds
-// to ~0 A (PV surplus covers it) does NOT spend an enter-blip.
-func TestNoEnterForZeroGridCharge(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 0, Window: win})
-	if got := fake.selectCalls(prioEntity); got != 0 {
-		t.Fatalf("zero grid-charge must not enter bypass; got %d blips", got)
-	}
-	if a.ep.inBypass || a.ep.entered {
-		t.Fatalf("zero grid-charge must not mark entered/inBypass, got %+v", a.ep)
-	}
-}
-
-// --- C2: space consecutive inverter writes (the live-trigger-test finding) ---
-
-// TestEnterWaitsForUTIAppliedBeforeAmps proves the enter GATES the amps write on
-// the output_priority having actually APPLIED (UTI visible in the state feed), not
-// merely on the service ack. The SRNE controller drops a rapid-fire second write;
-// the fix waits for the (slow) UTI echo before issuing amps, so the amps write is
-// not dropped. Exactly ONE output_priority write (one blip) must occur.
-func TestEnterWaitsForUTIAppliedBeforeAmps(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	// The SRNE echoes UTI only after a delay (slow state feed).
-	fake.mu.Lock()
-	fake.selectEchoDelay = 60 * time.Millisecond
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	waitAmpsSettled(t, a)
-
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("enter must be exactly one output_priority blip, got %d", got)
-	}
-	// The amps write must have been issued only AFTER output_priority read UTI.
-	if seen := fake.firstAmpsWritePrio(ampsEntity); seen != "UTI" {
-		t.Fatalf("amps write must be gated on UTI-applied; output_priority read %q at amps-write time", seen)
-	}
-	if v := fake.StateFloat(ampsEntity); v <= 0 {
-		t.Fatalf("amps must be written nonzero after UTI applied, got %v", v)
-	}
-	if !a.ep.entered || !a.ep.inBypass {
-		t.Fatalf("enter must remain entered/inBypass, got %+v", a.ep)
-	}
-}
-
-// TestDroppedAmpsRetriedAndLands proves a dropped mains-charge-current write is
-// retried within the same tick and lands, with NO extra output_priority blip.
-func TestDroppedAmpsRetriedAndLands(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	fake.mu.Lock()
-	fake.dropFirstAmps = true // SRNE drops the first amps write
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	waitAmpsSettled(t, a)
-
-	if v := fake.StateFloat(ampsEntity); v <= 0 {
-		t.Fatalf("dropped amps write must be retried and land nonzero, got %v", v)
-	}
-	if got := fake.ampsWriteCount(ampsEntity); got < 2 {
-		t.Fatalf("dropped amps write must be retried at least once, got %d amps writes", got)
-	}
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("amps retry must not add output_priority blips; want 1, got %d", got)
-	}
-}
-
-// TestSettleTimeoutStillSendsAmpsNoExtraBlip proves that when UTI never echoes
-// (settle wait times out — the slow-feed worst case), the actuator still sends the
-// amps write (advisory), does NOT reverse the blip, does NOT fail-safe, and stays
-// entered. This is the C1-safety guarantee applied to the new settle gate.
-func TestSettleTimeoutStillSendsAmpsNoExtraBlip(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	// UTI never echoes → the settle poll times out.
-	fake.mu.Lock()
-	fake.decoupleSelect = true
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	waitAmpsSettled(t, a)
-
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("settle timeout must not add a blip; want 1 output_priority write, got %d", got)
-	}
-	if last := fake.lastSelect(prioEntity); last != "UTI" {
-		t.Fatalf("settle timeout must not reverse to SBU; last select=%q", last)
-	}
-	if !a.ep.entered || !a.ep.inBypass {
-		t.Fatalf("settle timeout must keep entered/inBypass; got %+v", a.ep)
-	}
-	if v := fake.StateFloat(ampsEntity); v <= 0 {
-		t.Fatalf("settle timeout must still send amps (advisory), got %v", v)
-	}
-}
-
-// TestExitSpacedDroppedSBUCaughtByWatchdog proves the spaced exit is still exactly
-// one exit blip (2 per window total), and that a DROPPED SBU exit (echo never
-// lands, hardware stays UTI outside the window) is re-safed by the watchdog.
-func TestExitSpacedDroppedSBUCaughtByWatchdog(t *testing.T) {
-	a, fake, clock := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter (blip 1)
-
-	// Model the SRNE dropping the SBU exit write: select_option(SBU) is issued
-	// (blip 2) but the state never echoes SBU (stays UTI).
-	fake.mu.Lock()
-	fake.decoupleSelect = true
-	fake.mu.Unlock()
-	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID}) // exit (blip 2)
-
-	if got := fake.selectCalls(prioEntity); got != 2 {
-		t.Fatalf("enter+exit must be exactly 2 blips per window, got %d", got)
-	}
-	if last := fake.lastSelect(prioEntity); last != "SBU" {
-		t.Fatalf("exit must write SBU, got %q", last)
-	}
-
-	// Physically still UTI outside the window (dropped SBU) → watchdog re-safes.
-	clock.set(outWindow)
-	fake.mu.Lock()
-	fake.decoupleSelect = false // allow the re-safe to take effect
-	fake.states[prioEntity] = "UTI"
-	fake.mu.Unlock()
-	submitSync(t, a, command{kind: cmdWatchdog})
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatalf("watchdog must re-safe a dropped SBU exit; last=%q", fake.lastSelect(prioEntity))
-	}
-}
-
-// --- H4: enter's amps delivery must NOT block the loop's safing latency ---
-
-// longSettle holds an enter's amps delivery in phaseSettle for the whole test by
-// making the settle timeout long, so a safing command that arrives mid-enter can
-// be proven to preempt it (rather than wait it out). Set pre-Start (no race).
-func longSettle(a *Actuator) { a.settleTimeout = 5 * time.Second }
-
-// TestBoundarySafePreemptsPendingAmps proves a boundary exit arriving while the
-// enter's amps delivery is pending runs PROMPTLY — bounded well under the settle
-// window — instead of the pre-fix ~48-78s where the enter monopolised the loop.
-func TestBoundarySafePreemptsPendingAmps(t *testing.T) {
-	a, fake, _ := newActuatorTuned(t, ModeLive, inWindow, "SBU", longSettle)
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	// The UTI echo won't arrive during the test, so the amps delivery stays parked
-	// in phaseSettle (worst case for latency-to-safe).
-	fake.mu.Lock()
-	fake.selectEchoDelay = 5 * time.Second
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if !a.pendingActive.Load() {
-		t.Fatal("precondition: enter amps delivery must be pending")
-	}
-
-	start := time.Now()
-	submitSync(t, a, command{kind: cmdBoundary, windowID: win.ID})
-	elapsed := time.Since(start)
-
-	// Must be far below the 5s settle window (the loop-blocking bound is one
-	// in-flight write, not the settle wait). Generous ceiling for slow CI.
-	if elapsed > 2*time.Second {
-		t.Fatalf("boundary safe delayed by pending settle window: %v (settleTimeout=%v)", elapsed, a.settleTimeout)
-	}
-	if got := fake.selectCalls(prioEntity); got != 2 {
-		t.Fatalf("enter+boundary exit must be exactly 2 blips, got %d", got)
-	}
-	if last := fake.lastSelect(prioEntity); last != "SBU" {
-		t.Fatalf("boundary must drive SBU, got %q", last)
-	}
-	if a.pendingActive.Load() {
-		t.Fatal("exit must cancel the pending amps delivery")
-	}
-}
-
-// TestWatchdogSafePreemptsPendingAmps is the watchdog analogue: a stale feed
-// outside the window while the enter's amps delivery is pending must fail-safe
-// promptly, not wait out the settle window.
-func TestWatchdogSafePreemptsPendingAmps(t *testing.T) {
-	a, fake, clock := newActuatorTuned(t, ModeLive, inWindow, "SBU", longSettle)
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	fake.mu.Lock()
-	fake.selectEchoDelay = 5 * time.Second // hold pending in phaseSettle
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if !a.pendingActive.Load() {
-		t.Fatal("precondition: enter amps delivery must be pending")
-	}
-
-	// Outside every window with a stale/unknown feed → watchdog fail-safe.
-	clock.set(outWindow)
-	fake.mu.Lock()
-	fake.fresh[prioEntity] = false
-	fake.states[prioEntity] = "unknown"
-	fake.mu.Unlock()
-
-	start := time.Now()
-	submitSync(t, a, command{kind: cmdWatchdog})
-	elapsed := time.Since(start)
-
-	if elapsed > 2*time.Second {
-		t.Fatalf("watchdog safe delayed by pending settle window: %v", elapsed)
-	}
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatalf("watchdog must fail-safe to SBU while amps pending; last=%q", fake.lastSelect(prioEntity))
-	}
-	if a.pendingActive.Load() {
-		t.Fatal("watchdog safe must cancel the pending amps delivery")
-	}
-}
-
-// TestShutdownDuringPendingAmpsSafes proves shutdown while the enter's amps
-// delivery is still pending ALWAYS drives SBU (the deterministic loop backstop),
-// never skips the fail-safe, and does not wait out the settle window.
-func TestShutdownDuringPendingAmpsSafes(t *testing.T) {
-	a, fake, _ := newActuatorTuned(t, ModeLive, inWindow, "SBU", longSettle)
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	fake.mu.Lock()
-	fake.selectEchoDelay = 5 * time.Second // hold pending in phaseSettle
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if !a.pendingActive.Load() {
-		t.Fatal("precondition: enter amps delivery must be pending at shutdown")
-	}
-
-	start := time.Now()
-	a.Close()
-	elapsed := time.Since(start)
-
-	if fake.lastSelect(prioEntity) != "SBU" {
-		t.Fatalf("shutdown during pending amps must drive SBU; last=%q", fake.lastSelect(prioEntity))
-	}
-	if got := fake.selectCalls(prioEntity); got != 2 { // enter UTI + shutdown SBU
-		t.Fatalf("want exactly 2 blips (enter + shutdown safe), got %d", got)
-	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("shutdown must not wait out the settle window: %v", elapsed)
-	}
-}
-
-// --- Fix 3: unconfirmed amps must not set ep.amps (avoid believing we charge) ---
-
-// TestUndeliverableAmpsStaysConfirmedAndResends proves that when an amps write is
-// never confirmed (write+retry both fail read-back), ep.amps is LEFT at the last
-// confirmed value (0), so the next tick's doAdjust RE-SENDS (a non-blip write)
-// rather than epsilon-suppressing a charge that never landed.
-func TestUndeliverableAmpsStaysConfirmedAndResends(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, "SBU")
-	win, _ := a.rates.ActiveWindow(inWindow)
-
-	fake.mu.Lock()
-	fake.dropAmps = true // every amps write acked but never reflected
-	fake.mu.Unlock()
-
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win}) // enter
-	waitAmpsSettled(t, a)                                              // write + retry, then give up
-
-	if a.ep.amps != 0 {
-		t.Fatalf("undeliverable amps must leave ep.amps at last confirmed (0), got %v", a.ep.amps)
-	}
-	writesAfterEnter := fake.ampsWriteCount(ampsEntity)
-	if writesAfterEnter < 2 {
-		t.Fatalf("undeliverable amps must be attempted + retried (>=2 writes), got %d", writesAfterEnter)
-	}
-
-	// Next tick, same window, still charging (in bypass): ep.amps==0 vs a nonzero
-	// target is NOT epsilon-suppressed → doAdjust re-sends.
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5, Window: win})
-	if got := fake.ampsWriteCount(ampsEntity); got <= writesAfterEnter {
-		t.Fatalf("next tick must re-send amps (ep.amps stayed unconfirmed); writes %d→%d", writesAfterEnter, got)
-	}
-	if got := fake.selectCalls(prioEntity); got != 1 {
-		t.Fatalf("re-sends are non-blip; want exactly 1 output_priority blip, got %d", got)
+	if a.st.charging {
+		t.Fatal("failed start must not record charging")
 	}
 }

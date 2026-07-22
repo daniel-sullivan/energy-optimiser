@@ -111,8 +111,8 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		h.pvModel = pm
 	}
 
-	// Actuator — Phase-1 blip-safe grid-charge control. Defaults to observe
-	// (no inverter writes); live actuation requires an explicit mode = "live".
+	// Actuator — timed-charge grid-charge control. Defaults to observe (no
+	// inverter writes); live actuation requires an explicit mode = "live".
 	act, err := actuator.New(cfg.ActuatorHW, cfg.Battery, &cfg.Rates, h.ha, mode)
 	if err != nil {
 		if h.influx != nil {
@@ -326,19 +326,20 @@ func (h *Hub) tick(ctx context.Context) {
 
 // buildChargePlan derives the actuator's desired grid-charge state from the
 // current slot. It commands the GRID SHARE — the grid kW needed after expected
-// PV self-charge — never gross battery flow, and only ever inside an active
-// off-peak window. When the SOC is unknown it never initiates charging (the
-// solve ran on an assumed SOC purely for the dashboard).
+// PV self-charge — never gross battery flow, and only when the current slot is an
+// active off-peak window. When the SOC is unknown it never initiates charging
+// (the solve ran on an assumed SOC purely for the dashboard). The actuator
+// re-derives the off-peak window it programs from its own tariff config, so the
+// plan carries only whether-to-charge and the grid kW.
 func (h *Hub) buildChargePlan(now time.Time, slot *optimizer.Slot, socKnown bool) actuator.ChargePlan {
-	win, off := h.cfg.Rates.ActiveWindow(now)
-	charging := socKnown && slot.GridCharge && off
+	charging := socKnown && slot.GridCharge && h.cfg.Rates.IsOffPeak(now)
 	var gridKW float64
 	if charging {
 		batteryChargeKW := math.Max(0, slot.BatteryFlowKW) // positive = charging
 		pvSurplus := math.Max(0, slot.SolarKW-slot.LoadKW) // PV available to self-charge
 		gridKW = math.Max(0, batteryChargeKW-pvSurplus)
 	}
-	return actuator.ChargePlan{Charging: charging, GridKW: gridKW, Window: win}
+	return actuator.ChargePlan{Charging: charging, GridKW: gridKW}
 }
 
 // maybeRefreshSolar fetches a new solar forecast only when one of the

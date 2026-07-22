@@ -135,12 +135,15 @@ protection is directly comparable to grid-import cost.
 6. **Start link** — `start[t] ≥ gridCharge[t] − gridCharge[t−1]`: `start[t]` is forced to 1 exactly when grid-charge transitions off→on.
 7–9. **SOC-risk penalties** (piecewise-linear, one constraint per threshold) — `penX[t] + soc[t+1] ≥ threshold`, at 50%/30%/20% of capacity with increasing weight, so the solver trades off a little grid cost against staying above each floor.
 
-**Per-window bypass budget** — the horizon is segmented into maximal
+**Per-window grid-charge budget** — the horizon is segmented into maximal
 contiguous off-peak runs; within each run, `Σ start[t] ≤ 1`. Combined with
 the blip-cost objective term, this caps grid-charge entries to at most one
 per off-peak window and discourages marginal-gain entries entirely — the
-schedule reads as "charge or don't" per window rather than chattering the
-inverter's bypass relay.
+schedule reads as "charge or don't" per window rather than toggling the
+inverter's grid-charge state repeatedly. (The optimiser's `start[t]`/`blipCost`
+term predates the timed-charge actuator; it is retained as an anti-chatter /
+marginal-window penalty even though enabling timed charge is no longer a power
+"blip".)
 
 Peak-tariff slots have `gridCharge` fixed to a constant 0 (a continuous
 variable pinned to `[0,0]`, avoiding an unnecessary binary), so grid-charging
@@ -155,14 +158,50 @@ plan stays current without any explicit re-planning logic.
 
 ## Actuation
 
-`actuator/` executes only the current slot's grid-charge decision, via an
-MQTT publish to `{topic_prefix}/switch/{device_id}/charge_from_mains/set`
-(ON/OFF). `device_id` targets an existing MQTT-discovery device published by
-your inverter's own controller — energy-optimiser never talks to the
-inverter directly (no Modbus, no vendor protocol), it only flips the switch
-that controller already exposes. The reference target is an SRNE-class
-hybrid inverter driven by an MQTT controller, but any device exposing the
-same switch topic works.
+`actuator/` executes the current slot's grid-charge decision through the SRNE
+**timed-charge** mechanism — the only path that grid-charges this ASP/SRNE
+inverter (confirmed live). It calls Home Assistant service calls (not the
+inverter's protocol) against the aggregate SRNE-controller entities: a
+timed-charge enable switch, a per-unit mains-charge-current number, and the
+"HH:MM" charge-window text entities. The charge windows are a **static rail**:
+the actuator mirrors slot _i_ to configured off-peak window _i_, inset by
+`window_inset` (default 5 min) at both ends as a clock-skew guard so charging
+never leaks into peak, idempotently (only writing on a mismatch, so no churn),
+establishing it at startup and re-asserting it on the watchdog tick, and never
+touches the windows to start or stop a charge. A window shorter than 2×inset, or
+one whose inset bound would land on `00:00` (a wrap/zero-length misread), is
+skipped with a warning. Charging is driven by the
+**global enable switch** plus the per-unit current: to charge, ensure the rail is
+in place (usually a no-op), set the current, then enable the switch **last**; to
+stop, disable the switch **first**, then zero the current. Consecutive writes are
+spaced and confirmed by read-back (the SRNE drops rapid-fire writes); re-issuing
+is harmless (idempotent, not a power event). The per-unit current is
+`gridKW·1000 / (voltage · numUnits)`, numUnits = 2 parallel inverters.
+
+Actuation is mode-gated — `observe` (log only), `watchdog` (fail-safe writes
+only), `live` (full control) — resolved once at startup with a config-conflict
+guard.
+
+**Safety model.** The hazard is timed charge left *enabled* when it shouldn't be
+(unwanted/expensive grid charge, e.g. a crashed daemon leaving it on). Disabling
+is always the safe direction. The invariant: **timed charge is off whenever the
+actuator is not actively commanding a charge.** Three layers enforce it:
+
+1. **The charge windows are a static hardware rail** — grid charging can only
+   occur inside a programmed window; the actuator mirrors the configured off-peak
+   periods into the slots and an internal guard refuses to write a peak interval,
+   so no window is ever set to peak (and none is ever zeroed).
+2. **An out-of-window watchdog** — on its own ticker, it re-asserts the window
+   rail idempotently (self-healing a mid-life scramble) and, if timed charge reads
+   enabled (or the feed is stale) outside every off-peak window, disables it.
+3. **An out-of-band HA dead-man automation** (deployed separately) — if the
+   daemon's MQTT availability goes `offline` (its LWT fires on crash/disconnect),
+   HA disables the timed-charge switch and zeroes the current, so a dead daemon
+   can never leave grid charging running.
+
+Startup reconcile brings timed charge *off* (no fresh optimiser decision exists
+yet); the first tick re-enables within one poll interval if the solve wants grid
+charge — cheap, since toggling timed charge is not a power event.
 
 `serve.DecisionPublisher` is a separate concern: it publishes the *plan*
 (not a command) — grid-charge/battery-flow/import/SOC-target for the current

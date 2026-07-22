@@ -101,23 +101,39 @@ device_id = "srne_system"                 # actuation target: your inverter's MQ
 # username = ""                           # MQTT broker auth (blank = anonymous); supports env:VARNAME
 # password = ""
 
-# Phase-1 blip-safe grid-charge actuator. The only working grid-charge path on
-# this ASP/SRNE inverter is output_priority→UTI (utility bypass = one power blip)
-# then mains_charge_current > 0; rate changes are amps-only (no blip); exit is
-# output_priority→SBU (one blip). All fields have sensible SRNE-add-on defaults.
+# Timed-charge grid-charge actuator. The only working grid-charge path on this
+# ASP/SRNE inverter is the timed-charge mechanism: enable the timed-charge switch
+# inside a programmed off-peak charge window with mains_charge_current > 0 to draw
+# grid charge; disable the switch to stop. Toggling it is NOT a power blip. The
+# actuator manages the charge windows (a hardware rail — charging can only occur
+# inside a programmed window) and only ever programs them within off-peak hours.
+# All fields have sensible SRNE-add-on defaults.
 [actuator]
-# output_priority_select = "select.srne_solar_system_output_priority"
+# timed_charge_switch = "switch.srne_solar_system_timed_charge_grid"
 # mains_charge_current_number = "number.srne_solar_system_mains_charge_current"
 # battery_voltage_sensor = "sensor.srne_solar_system_battery_voltage"
-# utility_option = "UTI"          # exact select option for utility bypass (verified at runtime)
-# battery_option = "SBU"          # exact select option for battery-priority
 # num_units = 2                   # parallel inverter units the per-unit current applies to
 # max_charge_current_a = 100      # per-unit current clamp (A)
-# state_dir = "/data"             # persists the per-window blip budget across restart (default: pv_model.data_dir)
-# watchdog_interval = "30s"       # cadence of the never-stuck-in-bypass safety check
+# window_inset = "5m"             # shrink each mirrored charge window this much at both ends (clock-skew guard vs peak)
+# state_dir = "/data"             # persists the (informational) charge intent across restart (default: pv_model.data_dir)
+# watchdog_interval = "30s"       # cadence of the never-charging-outside-off-peak safety check + window-rail re-assert
 # write_timeout = "10s"           # per inverter write + ack
+# read_back_timeout = "45s"       # bound on the read-back that confirms a write landed (SRNE echo ~20-40s); too short churns retries
 # voltage_stale = "5m"            # battery-voltage reading older than this → nominal-voltage fallback
-# state_stale = "5m"              # output-priority reading older than this → watchdog fail-safe
+# state_stale = "5m"              # timed-charge switch reading older than this → watchdog disables it outside a window
+#
+# The inverter's 3 timed-charge window slots ("HH:MM" text entities). The actuator
+# statically mirrors slot i to configured off-peak window i (idempotently); slots
+# with no corresponding off-peak window are left untouched.
+# [[actuator.charge_windows]]
+# start = "text.srne_solar_system_charge_window_1_start"
+# end = "text.srne_solar_system_charge_window_1_end"
+# [[actuator.charge_windows]]
+# start = "text.srne_solar_system_charge_window_2_start"
+# end = "text.srne_solar_system_charge_window_2_end"
+# [[actuator.charge_windows]]
+# start = "text.srne_solar_system_charge_window_3_start"
+# end = "text.srne_solar_system_charge_window_3_end"
 
 [alertmanager]
 # url = "http://alertmanager:9093"        # POST decision/risk alerts to an Alertmanager (blank = disabled); it routes to Discord/etc.

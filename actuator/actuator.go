@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"energy-optimiser/config"
@@ -27,26 +26,39 @@ const adjustEpsilon = 0.5
 // toward the current ceiling. Below this, kW→A falls back to nominal voltage.
 const minPlausibleVoltageV = 40.0
 
-// Write-spacing constants. The SRNE controller drops rapid-fire consecutive
-// writes ("space writes" — a documented behaviour of this inverter/controller):
-// a second inverter write issued while it is still processing the previous one
-// (e.g. the amps write landing while the bypass transition is still settling) is
-// silently dropped. The enter sequence is therefore spaced — after the
-// output_priority (UTI) write we wait for the inverter to actually APPLY it, then
-// pause, before issuing the mains-charge-current write.
+// HA service plumbing. The actuator commands the SRNE inverter through three
+// standard HA entity types: a switch (timed-charge enable), a number (per-unit
+// charge current), and text entities (the "HH:MM" charge-window bounds).
 const (
-	// writeSettleTimeout bounds the poll that waits for an output_priority write
-	// to be echoed back by the (slow) SRNE state feed before the following write
-	// is issued. Generous because the SRNE echo lags seconds behind the ack. On
-	// timeout the following write proceeds anyway (advisory) — the blip is already
-	// spent and the next-tick doAdjust recovers; see doEnter.
-	writeSettleTimeout = 15 * time.Second
-	// writeSettlePollInterval is the cadence of the settle/read-back poll while
-	// waiting for a write to apply.
-	writeSettlePollInterval = 1 * time.Second
-	// writeSettleDelay spaces ANY two consecutive inverter writes (enter: UTI→amps;
-	// exit: amps0→SBU) so the second is not dropped by the controller.
-	writeSettleDelay = 1500 * time.Millisecond
+	switchDomain = "switch"
+	numberDomain = "number"
+	textDomain   = "text"
+
+	switchOn  = "on"
+	switchOff = "off"
+)
+
+// Write-spacing / confirmation constants. The SRNE controller DROPS rapid-fire
+// consecutive writes to these registers (proven live): a second write issued
+// while it is still processing the previous one is silently ignored. Every
+// inverter write is therefore (a) spaced from the previous one and (b) confirmed
+// by a state-cache read-back, retried until it lands. Unlike the retired bypass
+// model, re-issuing is HARMLESS here — enabling an already-enabled switch or
+// re-setting a value is idempotent and is NOT a power blip — so we can genuinely
+// retry-until-confirmed with no double-spend hazard.
+const (
+	// writeSpacing separates any two consecutive inverter writes.
+	writeSpacing = 1500 * time.Millisecond
+	// writeConfirmPollInterval is the read-back poll cadence while awaiting a
+	// write to be echoed by the (slow) SRNE state feed.
+	writeConfirmPollInterval = 1 * time.Second
+	// writeConfirmTimeout bounds the read-back poll when ActuatorHW.ReadBackTimeout
+	// is unset. Generous: the SRNE echo/apply lag for these entities is ~20-40s, so
+	// this must comfortably exceed it or every legitimate write churns retries.
+	writeConfirmTimeout = 45 * time.Second
+	// maxWriteRetries is the number of spaced re-issues (after the first attempt)
+	// before a write is reported unconfirmed.
+	maxWriteRetries = 2
 )
 
 var errClosed = errors.New("actuator: closed")
@@ -62,29 +74,39 @@ type haClient interface {
 }
 
 // ChargePlan is the policy's desired grid-charge state for the current tick. The
-// hub computes the GRID SHARE (grid kW after expected PV) and the active
-// off-peak window; the actuator owns the kW→A conversion and the blip-safe
-// bypass state machine.
+// hub decides WHETHER to charge (SOC known, optimiser permits, and now is inside
+// an off-peak window) and the GRID SHARE in kW; the actuator owns the kW→A
+// conversion, the timed-charge window/current/enable sequencing, and the
+// off-peak hardware rail. The actuator re-derives the active off-peak window from
+// its own tariff config, so a window is never taken on trust from the caller.
 type ChargePlan struct {
 	Charging bool
 	GridKW   float64
-	Window   config.OffPeakOccurrence
 }
 
-// episode is the persisted per-window bypass state. It is owned exclusively by
-// the single actuator goroutine (loop); no other goroutine touches it.
-type episode struct {
-	windowID string
-	inBypass bool
+// chargeState is the actuator's commanded intent, owned exclusively by the single
+// loop goroutine. charging reflects our last CONFIRMED timed-charge-enable; amps
+// is the last confirmed per-unit current setpoint. The charge windows are a
+// STATIC rail (mirrored from the off-peak config), not per-charge state, so they
+// are not tracked here.
+type chargeState struct {
+	charging bool
 	amps     float64
-	entered  bool // an enter-blip has been spent in this window
-	exited   bool // an exit-blip has been spent in this window
 }
 
-// Actuator is the Phase-1 blip-safe grid-charge actuator. Every inverter write —
-// policy and watchdog alike — is funnelled through one goroutine via a command
-// channel, so the UTI-then-amps enter sequence is atomic with respect to the
-// watchdog and the per-window blip budget is enforced single-threaded.
+// Actuator drives grid charging via the SRNE TIMED-CHARGE mechanism. Every
+// inverter write — policy, watchdog, shutdown — is funnelled through one
+// goroutine via a command channel, so the window/current/enable sequence is
+// atomic with respect to the watchdog's out-of-window backstop.
+//
+// Safety model (inverted from the retired bypass actuator): the hazard is timed
+// charge left ENABLED when it shouldn't be (unwanted/expensive grid charge, e.g.
+// a crashed daemon leaving it on). DISABLING is always the safe direction, so it
+// is issued freely and retried. The invariant is: timed_charge is OFF whenever
+// the actuator is not actively commanding a charge. Two backstops reinforce it —
+// the inverter's charge windows (a hardware rail: charging can only occur inside
+// a programmed off-peak window) and an out-of-band HA dead-man automation that
+// disables timed charge if the daemon's MQTT availability goes offline.
 type Actuator struct {
 	cfg     config.ActuatorHW
 	battery config.Battery
@@ -99,75 +121,36 @@ type Actuator struct {
 	startOnce sync.Once
 	closeOnce sync.Once
 
-	// now is the clock, injectable in tests.
+	// now is the policy clock, injectable in tests. Write spacing/confirmation
+	// uses real wall-clock (device latency is physical), never this clock.
 	now func() time.Time
 
-	// Write-spacing knobs. Default to the package consts; tests override them to
-	// keep the suite fast (real device latency is seconds).
-	settleTimeout time.Duration
-	settleDelay   time.Duration
-	settlePoll    time.Duration
+	// Write-spacing/confirm knobs. Default to the package consts / cfg; tests
+	// override them to keep the suite fast (real device latency is seconds).
+	confirmTimeout time.Duration
+	spacing        time.Duration
+	confirmPoll    time.Duration
 
-	// Goroutine-owned (loop only):
-	ep            episode
-	boundaryTimer *time.Timer
-	// pending is the in-flight, NON-BLOCKING amps delivery following an enter (H4
-	// fix). The enter-blip is spent synchronously on the loop; the UTI-settle wait
-	// and amps write/retry are then driven incrementally by servicePending between
-	// commands, so cmdWatchdog/cmdBoundary/cmdSafe preempt promptly. Loop-owned.
-	pending *pendingEnter
-	// duringShutdown makes pause/pollState use non-abortable (full-spacing) waits
-	// for the final fail-safe, so the shutdown SBU write is never dropped by the
-	// controller's "space writes" rule. Set only on the loop's shutdown path.
+	// Loop-owned (single goroutine):
+	st chargeState
+	// duringShutdown makes pause/awaitConfirmed use non-abortable waits for the
+	// final fail-safe, so the shutdown disable write is never dropped.
 	duringShutdown bool
-
-	// pendingActive mirrors (pending != nil) for race-free observation from other
-	// goroutines (tests await amps-delivery completion). Written only by the loop.
-	pendingActive atomic.Bool
-}
-
-// enterPhase tracks the non-blocking amps-delivery follow-up to an enter.
-type enterPhase int
-
-const (
-	// phaseSettle: waiting for output_priority→UTI to APPLY (echo in the state
-	// feed) or the advisory settle deadline to elapse, before the amps write.
-	phaseSettle enterPhase = iota
-	// phaseSpace: honouring the write-spacing delay before issuing the amps write.
-	phaseSpace
-	// phaseConfirm: amps write issued; polling the read-back until it lands (or a
-	// deadline, which triggers one spaced retry then give-up).
-	phaseConfirm
-)
-
-// pendingEnter is the loop-owned state for the async amps delivery after an
-// enter-blip. It carries only wall-clock deadlines and phase; every field is
-// touched exclusively by the loop goroutine (via servicePending).
-type pendingEnter struct {
-	amps     float64
-	phase    enterPhase
-	settleAt time.Time // phaseSettle: proceed to the amps write once reached
-	writeAt  time.Time // phaseSpace: earliest time to issue the amps write
-	landAt   time.Time // phaseConfirm: retry/give-up deadline for the read-back
-	retried  bool
 }
 
 type cmdKind int
 
 const (
 	cmdPlan cmdKind = iota
-	cmdBoundary
 	cmdWatchdog
 	cmdSafe
 )
 
 type command struct {
-	kind     cmdKind
-	plan     ChargePlan
-	windowID string // cmdBoundary
-	reason   string // cmdSafe
-	force    bool   // cmdSafe: write even if bypass not currently suspected
-	done     chan error
+	kind   cmdKind
+	plan   ChargePlan
+	reason string // cmdSafe
+	done   chan error
 }
 
 // New constructs the actuator. It performs no I/O and starts no goroutines;
@@ -189,15 +172,19 @@ func New(cfg config.ActuatorHW, battery config.Battery, rates *config.Rates, ha 
 		closed:  make(chan struct{}),
 		now:     time.Now,
 
-		settleTimeout: writeSettleTimeout,
-		settleDelay:   writeSettleDelay,
-		settlePoll:    writeSettlePollInterval,
+		confirmTimeout: cfg.ReadBackTimeout.Duration,
+		spacing:        writeSpacing,
+		confirmPoll:    writeConfirmPollInterval,
+	}
+	if a.confirmTimeout <= 0 {
+		a.confirmTimeout = writeConfirmTimeout
 	}
 	slog.Info("actuator: initialised",
 		"mode", mode,
-		"output_priority", cfg.OutputPrioritySelect,
+		"timed_charge_switch", cfg.TimedChargeSwitch,
 		"mains_current", cfg.MainsChargeCurrentNumber,
-		"num_units", cfg.NumUnits)
+		"num_units", cfg.NumUnits,
+		"charge_window_slots", len(cfg.ChargeWindows))
 	return a, nil
 }
 
@@ -205,41 +192,35 @@ func New(cfg config.ActuatorHW, battery config.Battery, rates *config.Rates, ha 
 // write-owning goroutine and the independent watchdog ticker. Idempotent. Must
 // be called after the HA client has connected and loaded states.
 func (a *Actuator) Start(ctx context.Context) error {
-	var startErr error
+	var err error
 	a.startOnce.Do(func() {
 		a.loadPersist()
-		// Reconcile runs inline before the loop goroutine starts, so ep access
-		// stays single-threaded. Any boundary timer it arms enqueues onto the
-		// buffered command channel and is drained once the loop is up.
-		startErr = a.reconcile(ctx)
+		// Reconcile runs inline before the loop goroutine starts, so state access
+		// stays single-threaded.
+		err = a.reconcile(ctx)
 		a.wg.Add(2)
 		go a.loop()
 		go a.watchdogTicker(ctx)
 	})
-	return startErr
+	return err
 }
 
 // SetChargePlan submits the policy's desired grid-charge state and blocks until
-// the resulting transition (if any) has been applied. In observe/watchdog mode
-// this only logs the intent.
+// the resulting writes have been applied. In observe/watchdog mode this only
+// logs the intent.
 func (a *Actuator) SetChargePlan(ctx context.Context, plan ChargePlan) error {
 	return a.submit(ctx, command{kind: cmdPlan, plan: plan})
 }
 
-// Close force-safes the inverter (battery-priority + zero grid charge, if bypass
-// is suspected) then stops all goroutines. Idempotent.
-//
-// The shutdown fail-safe is run DETERMINISTICALLY by the loop itself (see
-// shutdownSafe), not submitted as a racing cmdSafe: closing a.closed makes the
-// loop cancel any pending amps, drive SBU, then exit. This removes the old
-// select-race where a.closed could be picked over a still-queued cmdSafe and skip
-// safing, and needs no write-timeout budget tuning. If Start was never called the
-// loop does not exist and there is nothing to safe.
+// Close disables timed charge (the guaranteed-safe state) then stops all
+// goroutines. Idempotent. The fail-safe is run DETERMINISTICALLY by the loop
+// itself (shutdownSafe), not submitted as a racing cmdSafe: closing a.closed makes
+// the loop drive the disable then exit. If Start was never called the loop does
+// not exist and there is nothing to safe.
 func (a *Actuator) Close() {
 	a.closeOnce.Do(func() {
 		close(a.closed)
 		a.wg.Wait()
-		a.stopBoundaryTimer()
 	})
 }
 
@@ -263,8 +244,8 @@ func (a *Actuator) submit(ctx context.Context, c command) error {
 	}
 }
 
-// submitAsync enqueues a command without waiting (used by the timer/watchdog
-// goroutines). It never blocks past close.
+// submitAsync enqueues a command without waiting (used by the watchdog
+// goroutine). It never blocks past close.
 func (a *Actuator) submitAsync(c command) {
 	select {
 	case a.cmds <- c:
@@ -272,21 +253,14 @@ func (a *Actuator) submitAsync(c command) {
 	}
 }
 
-// loop is the sole owner of episode state and inverter writes.
-//
-// Worst-case latency-to-safe: a cmdWatchdog/cmdBoundary/cmdSafe arriving while an
-// enter's amps delivery is pending waits at most for one in-flight inverter write
-// ack — bounded by WriteTimeout (default 10s) — never the full enter settle
-// window (~48–78s pre-fix). servicePending performs at most ONE writeAmps per
-// tick and only sub-millisecond state reads otherwise, so the loop is never
-// blocked longer than a single write's ack before it can service a safing
-// command. Typically the safe runs within one settlePoll tick (≪ WriteTimeout).
+// loop is the sole owner of chargeState and inverter writes. Commands (a policy
+// plan, a watchdog check, a safe) are handled one at a time; each is bounded by a
+// few spaced, confirmed writes. Because timed charge is enabled LAST in a start
+// sequence, the dangerous state (switch on) exists only after a command completes,
+// so a following safing command always runs promptly between commands — no
+// mid-write preemption machinery is required.
 func (a *Actuator) loop() {
 	defer a.wg.Done()
-	// timer drives servicePending. Armed to settlePoll while an amps delivery is
-	// pending, parked far in the future when idle (so an idle loop never spins).
-	timer := time.NewTimer(time.Hour)
-	defer timer.Stop()
 	for {
 		// Give shutdown priority: if closed is already signalled, safe and exit
 		// deterministically rather than risk the select picking another ready case.
@@ -296,7 +270,6 @@ func (a *Actuator) loop() {
 			return
 		default:
 		}
-		a.armServiceTimer(timer)
 		select {
 		case <-a.closed:
 			a.shutdownSafe()
@@ -306,130 +279,31 @@ func (a *Actuator) loop() {
 			if c.done != nil {
 				c.done <- err
 			}
-		case <-timer.C:
-			a.servicePending()
 		}
 	}
-}
-
-// armServiceTimer resets the service timer to the poll cadence while an amps
-// delivery is pending, or parks it when idle. Uses the stop-drain-reset pattern
-// so it is safe regardless of whether the timer had already fired.
-func (a *Actuator) armServiceTimer(t *time.Timer) {
-	d := time.Hour
-	if a.pending != nil {
-		d = a.settlePoll
-		if d <= 0 {
-			d = 5 * time.Millisecond
-		}
-	}
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	t.Reset(d)
 }
 
 // shutdownSafe is the deterministic fail-safe run by the loop before it exits on
-// close. It cancels any pending amps delivery and drives SBU if bypass is (or may
-// be) active. It runs with non-abortable write-spacing (duringShutdown) so the
-// SBU write is never dropped by the controller. Idempotent: a no-op write when
-// bypass is not suspected, and a no-op entirely in observe mode.
+// close: it disables timed charge and zeroes the current with non-abortable
+// write-spacing (duringShutdown), so the disable is never dropped. Idempotent —
+// a no-op when already stopped, and a no-op entirely in observe mode.
 func (a *Actuator) shutdownSafe() {
 	a.duringShutdown = true
-	a.cancelPending()
-	if err := a.doSafe("shutdown", false); err != nil {
-		slog.Warn("actuator: shutdown fail-safe failed", "error", err)
+	if err := a.stopCharge("shutdown"); err != nil {
+		slog.Warn("actuator: shutdown fail-safe (disable timed charge) failed", "error", err)
 	}
-}
-
-// cancelPending discards an in-flight amps delivery. Called by every transition
-// that supersedes the enter's amps target (adjust/stop) or leaves bypass
-// (exit/safe/rollover), so a late pending write can never re-charge after a stop
-// or override an explicit setpoint. Loop-only.
-func (a *Actuator) cancelPending() {
-	if a.pending != nil {
-		slog.Info("actuator: cancelling pending amps delivery", "phase", a.pending.phase)
-		a.pending = nil
-	}
-	a.pendingActive.Store(false)
-}
-
-// servicePending advances the async amps delivery by one bounded step. It reads
-// state (sub-ms) and issues at most ONE writeAmps (bounded by WriteTimeout) per
-// call, then returns so the loop can service other commands. It NEVER sleeps or
-// polls in a loop — the loop's timer supplies the cadence. Loop-only.
-func (a *Actuator) servicePending() {
-	p := a.pending
-	if p == nil {
-		return
-	}
-	// Real wall-clock: device settle/echo latency is physical, not the injectable
-	// policy clock (which tests freeze).
-	now := time.Now()
-	switch p.phase {
-	case phaseSettle:
-		// Advance once UTI has APPLIED (echoed) or the advisory settle elapsed.
-		// ADVISORY (preserves C1): a settle timeout means the echo lagged, not that
-		// the enter failed — the blip is already spent; we proceed to amps anyway.
-		if a.ha.State(a.cfg.OutputPrioritySelect) == a.cfg.UtilityOption || !now.Before(p.settleAt) {
-			p.phase = phaseSpace
-			p.writeAt = now.Add(a.settleDelay)
-		}
-	case phaseSpace:
-		if now.Before(p.writeAt) {
-			return
-		}
-		if err := a.writeAmps(p.amps); err != nil {
-			slog.Warn("actuator: pending amps write not accepted", "error", err, "retried", p.retried)
-			a.afterUnconfirmedAmps(p, now)
-			return
-		}
-		// Amps write accepted; poll the (slow) read-back until it lands.
-		p.phase = phaseConfirm
-		p.landAt = now.Add(a.settleTimeout)
-	case phaseConfirm:
-		if a.ampsConfirmed(p.amps) {
-			a.ep.amps = p.amps // CONFIRMED landed
-			a.persist()
-			a.cancelPending()
-			return
-		}
-		if now.Before(p.landAt) {
-			return
-		}
-		a.afterUnconfirmedAmps(p, now)
-	}
-}
-
-// afterUnconfirmedAmps retries the amps write once (spaced) or gives up. On
-// give-up it leaves ep.amps at the last CONFIRMED value (Fix 3) — never the
-// commanded-but-unconfirmed value — so the next tick's doAdjust re-sends (a
-// non-blip write) rather than epsilon-suppressing a charge that never landed.
-func (a *Actuator) afterUnconfirmedAmps(p *pendingEnter, now time.Time) {
-	if !p.retried {
-		p.retried = true
-		p.phase = phaseSpace
-		p.writeAt = now.Add(a.settleDelay)
-		return
-	}
-	slog.Warn("actuator: enter amps delivery unconfirmed after retry — ep.amps left at last "+
-		"confirmed value; next adjust will re-send", "commanded", round1(p.amps), "confirmed", round1(a.ep.amps))
-	a.cancelPending()
 }
 
 func (a *Actuator) handle(c command) (err error) {
 	// Defense in depth: a panic in any transition (e.g. a nil deref reaching the HA
-	// client) must NEVER strand the inverter in bypass with no actor to safe it, nor
-	// kill the write-owning goroutine. Recover, log with the stack, best-effort force
-	// SBU, and return an error so the caller (if any) sees the failure; the loop then
-	// continues serving subsequent commands.
+	// client) must NEVER leave grid charging running with no actor to stop it, nor
+	// kill the write-owning goroutine. Recover, log with the stack, best-effort
+	// disable, and return an error so the caller (if any) sees the failure; the loop
+	// then continues serving subsequent commands.
 	defer func() {
 		if r := recover(); r != nil {
 			stack := string(debug.Stack())
-			slog.Error("actuator: PANIC in command handler — attempting fail-safe",
+			slog.Error("actuator: PANIC in command handler — attempting fail-safe (disable timed charge)",
 				"kind", c.kind, "panic", r, "stack", stack)
 			a.safeAfterPanic()
 			err = fmt.Errorf("actuator: recovered panic in command kind %d: %v", c.kind, r)
@@ -438,19 +312,17 @@ func (a *Actuator) handle(c command) (err error) {
 	switch c.kind {
 	case cmdPlan:
 		return a.handlePlan(c.plan)
-	case cmdBoundary:
-		return a.handleBoundary(c.windowID)
 	case cmdWatchdog:
 		return a.handleWatchdog()
 	case cmdSafe:
-		return a.doSafe(c.reason, c.force)
+		return a.stopCharge(c.reason)
 	default:
 		return fmt.Errorf("actuator: unknown command kind %d", c.kind)
 	}
 }
 
-// safeAfterPanic force-safes the inverter after a recovered panic, itself guarded
-// against a further panic (the panic source may be the HA client, which doSafe
+// safeAfterPanic disables timed charge after a recovered panic, itself guarded
+// against a further panic (the panic source may be the HA client, which stopCharge
 // also touches) so recovery can never re-crash the goroutine.
 func (a *Actuator) safeAfterPanic() {
 	defer func() {
@@ -458,229 +330,184 @@ func (a *Actuator) safeAfterPanic() {
 			slog.Error("actuator: fail-safe after panic also panicked", "panic", r)
 		}
 	}()
-	if err := a.doSafe("panic recovery", true); err != nil {
+	if err := a.stopCharge("panic recovery"); err != nil {
 		slog.Error("actuator: fail-safe after panic failed", "error", err)
 	}
 }
 
-// --- policy state machine ---
+// --- policy ---
 
 func (a *Actuator) handlePlan(plan ChargePlan) error {
 	if !a.mode.actuates() {
 		slog.Info("actuator: policy (no-op in current mode)",
-			"mode", a.mode, "charging", plan.Charging,
-			"grid_kw", round1(plan.GridKW), "window", plan.Window.ID)
+			"mode", a.mode, "charging", plan.Charging, "grid_kw", round1(plan.GridKW))
 		return nil
 	}
 
-	// Window rollover resets the per-window blip budget.
-	if plan.Window.ID != "" && plan.Window.ID != a.ep.windowID {
-		if a.ep.inBypass {
-			// Defensive: the boundary timer should have exited the prior window.
-			if err := a.doExit("window rollover with open bypass"); err != nil {
-				return err
-			}
-		}
-		// A new window supersedes any pending amps delivery from the prior window.
-		a.cancelPending()
-		a.setEpisode(episode{windowID: plan.Window.ID})
-	}
-
-	if !plan.Charging {
-		if a.ep.inBypass {
-			// Stop charging but STAY in bypass (loads keep running on cheap grid);
-			// the exit blip is spent only at the window boundary.
-			return a.doStop()
-		}
-		return nil
-	}
-
-	if plan.Window.ID == "" {
-		slog.Warn("actuator: charge requested with no active off-peak window — ignoring")
-		return nil
+	// Deriving `off` from our own tariff config (not the caller) is a layer of the
+	// off-peak rail — a charge is never commanded outside off-peak hours. The static
+	// window rail (see ensureWindowsMirrorOffPeak) and the enable switch, off
+	// outside off-peak, are the other two layers.
+	_, off := a.rates.ActiveWindow(a.now())
+	if !plan.Charging || !off {
+		return a.stopCharge("policy: no grid charge scheduled")
 	}
 
 	amps := a.kwToAmps(plan.GridKW)
-	if a.ep.inBypass {
-		return a.doAdjust(amps) // blip-free
-	}
-	if a.ep.entered {
-		slog.Warn("actuator: refusing second bypass enter this window (blip budget spent)",
-			"window", a.ep.windowID)
-		return nil
-	}
-	return a.doEnter(amps, plan.Window)
-}
-
-func (a *Actuator) handleBoundary(windowID string) error {
-	// Boundary exit is a safing-class action (prevents staying in bypass past the
-	// window), so it is permitted whenever any write is allowed.
-	if !a.mode.mayWrite() {
-		return nil
-	}
-	if a.ep.inBypass && a.ep.windowID == windowID && !a.ep.exited {
-		return a.doExit("window-end boundary")
-	}
-	return nil
-}
-
-// --- transitions (each writes to the inverter) ---
-
-// doEnter enters utility bypass (one blip) then sets the charge current.
-//
-// C1 (blip-safety invariant): the enter-blip is spent on the SERVICE ACK, not on
-// the state read-back. Home Assistant's `result` frame acks when the select
-// service coroutine runs (the MQTT command is published) — the SRNE select
-// entity's state_changed echo can lag seconds behind. If we waited for the echo
-// and it timed out, a write that PHYSICALLY entered UTI would look failed, the
-// budget would not be consumed, and the next tick would re-enter → unbounded
-// blips. So once CallServiceAck reports acceptance we treat the change as having
-// happened; the read-back is advisory only.
-func (a *Actuator) doEnter(amps float64, win config.OffPeakOccurrence) error {
-	// L7: never spend an enter-blip to charge nothing. If the grid share rounds to
-	// ~0 A (instantaneous PV surplus covers the plan), stay out of bypass.
 	if round1(amps) <= 0 {
-		slog.Info("actuator: skip ENTER — commanded grid charge rounds to zero (no blip)",
-			"window", win.ID)
-		return nil
+		// Instantaneous PV surplus covers the plan — nothing to draw from grid.
+		slog.Info("actuator: grid charge rounds to zero — ensuring timed charge off")
+		return a.stopCharge("policy: grid charge rounds to zero")
 	}
-	// Per-window enter hysteresis: once an enter has been ack-accepted for this
-	// window the budget is spent; never issue a second output_priority enter, even
-	// if episode state looks inconsistent. (handlePlan also guards this; keep both.)
-	if a.ep.entered {
-		slog.Warn("actuator: refusing bypass enter — enter budget already spent this window",
-			"window", win.ID)
-		return nil
-	}
-	slog.Info("actuator: ENTER bypass (blip)", "window", win.ID, "amps", round1(amps))
-	if err := a.ackPriority(a.cfg.UtilityOption); err != nil {
-		// The service was NOT accepted → no blip occurred, budget NOT spent. Do not
-		// mark entered and do NOT fail-safe (that would blip on an assumption); the
-		// next tick simply retries the enter.
-		slog.Warn("actuator: ENTER priority write not accepted — will retry next tick", "error", err)
-		return err
-	}
-	// Ack accepted: the enter-blip is spent NOW, before (and independent of) any
-	// read-back. Persist immediately so a crash between here and the amps write
-	// cannot lose the record and re-enter on restart.
-	a.ep.inBypass = true
-	a.ep.entered = true
-	a.armBoundary(win)
-	a.persist()
 
-	// H4 fix: the amps delivery is a NON-BLOCKING follow-up. The SRNE controller
-	// drops a second write issued while it is still applying the bypass transition
-	// ("space writes"), so the amps write must wait for UTI to APPLY, then be
-	// spaced. Rather than block the loop goroutine polling+sleeping for up to
-	// ~48–78s (which would delay watchdog/boundary/safe by the same), we schedule
-	// the wait + amps write/retry as loop-serviced pending state (servicePending),
-	// so safing commands preempt within one in-flight write (≤ WriteTimeout).
-	//
-	// ADVISORY (preserves C1): the settle wait is advisory — a timeout means the
-	// echo lagged, NOT that the enter failed. It never reverses entered/inBypass
-	// nor triggers doSafe (that would be an extra blip). On timeout servicePending
-	// still issues the amps write and the next tick recovers.
-	a.pending = &pendingEnter{
-		amps:     amps,
-		phase:    phaseSettle,
-		settleAt: time.Now().Add(a.settleTimeout),
-	}
-	a.pendingActive.Store(true)
-	return nil
+	return a.startCharge(amps)
 }
 
-// doAdjust changes the charge current only (no blip).
-func (a *Actuator) doAdjust(amps float64) error {
-	// An explicit adjust supersedes any in-flight enter amps delivery; cancel it so
-	// a late pending write cannot overwrite this setpoint.
-	a.cancelPending()
-	if math.Abs(amps-a.ep.amps) < adjustEpsilon {
-		return nil
+// startCharge establishes (or continues) grid charging. The charge windows are a
+// STATIC rail mirrored from the off-peak config, so a start never rewrites windows
+// per-charge — it only ensures the rail is in place (idempotent), sets the current,
+// and enables the global timed-charge switch LAST, so charging only ever begins
+// once correctly configured. Continuing while already charging is just a cheap
+// live current adjust (the switch is already on).
+func (a *Actuator) startCharge(amps float64) error {
+	if a.st.charging {
+		return a.adjustCurrent(amps)
 	}
-	slog.Info("actuator: adjust charge current (no blip)", "amps", round1(amps))
-	if err := a.writeAmps(amps); err != nil {
-		return err
-	}
-	a.ep.amps = amps
-	a.persist()
-	return nil
-}
 
-// doStop sets the charge current to zero but stays in bypass (no blip).
-func (a *Actuator) doStop() error {
-	// Cancel a pending enter amps delivery so it cannot re-raise current after stop.
-	a.cancelPending()
-	if a.ep.amps == 0 {
-		return nil
-	}
-	slog.Info("actuator: stop charging (amps=0, staying in bypass)")
-	if err := a.writeAmps(0); err != nil {
-		return err
-	}
-	a.ep.amps = 0
-	a.persist()
-	return nil
-}
+	slog.Info("actuator: START grid charge", "amps", round1(amps))
 
-// doExit sets amps to zero then exits bypass to battery-priority (one blip).
-func (a *Actuator) doExit(reason string) error {
-	// Leaving bypass supersedes any in-flight enter amps delivery.
-	a.cancelPending()
-	slog.Info("actuator: EXIT bypass (blip)", "reason", reason, "window", a.ep.windowID)
-	var errs []error
-	if err := a.writeAmps(0); err != nil {
-		errs = append(errs, err)
+	// Ensure the static off-peak window rail (idempotent — usually a no-op after
+	// reconcile). If it does not confirm, do NOT enable: the switch stays off
+	// (nothing charges) and the next tick retries.
+	wrote, err := a.ensureWindowsMirrorOffPeak()
+	if err != nil {
+		return fmt.Errorf("ensure charge windows (timed charge NOT enabled): %w", err)
 	}
-	// Space the SBU write from the amps=0 write — a dropped SBU is the dangerous one
-	// (strand-in-bypass), so we must not let the controller drop it as a rapid-fire
-	// consecutive write. writePriority still confirms SBU via an advisory read-back.
+	if wrote {
+		a.pause()
+	}
+	if err := a.setCurrent(amps); err != nil {
+		return fmt.Errorf("set charge current (timed charge NOT enabled): %w", err)
+	}
 	a.pause()
-	if err := a.writePriority(a.cfg.BatteryOption); err != nil {
-		errs = append(errs, err)
+	// Enable LAST.
+	if err := a.setTimedCharge(true); err != nil {
+		// Enable unconfirmed — the switch may be off, so record NOT charging and let
+		// the next tick retry the (idempotent) start.
+		a.st = chargeState{amps: round1(amps)}
+		a.persist()
+		return fmt.Errorf("enable timed charge: %w", err)
 	}
-	a.ep.inBypass = false
-	a.ep.amps = 0
-	a.ep.exited = true
-	a.stopBoundaryTimer()
+	a.st = chargeState{charging: true, amps: round1(amps)}
 	a.persist()
-	return errors.Join(errs...)
+	return nil
 }
 
-// doSafe forces battery-priority + zero charge. force writes unconditionally;
-// otherwise it writes only when bypass is suspected (last-known UTI, our episode
-// says in-bypass, or the state is unknown/stale). No-op (log only) in observe.
-func (a *Actuator) doSafe(reason string, force bool) error {
-	// Safing supersedes any in-flight enter amps delivery.
-	a.cancelPending()
+// adjustCurrent changes the live per-unit charge rate while timed charge is
+// already enabled in the current window. No switch/window writes; epsilon-
+// suppressed for negligible changes. On a failed write it leaves st.amps at the
+// last confirmed value so the next tick re-sends rather than epsilon-suppressing
+// a rate that never landed.
+func (a *Actuator) adjustCurrent(amps float64) error {
+	target := round1(amps)
+	if math.Abs(target-a.st.amps) < adjustEpsilon {
+		return nil
+	}
+	slog.Info("actuator: adjust charge current", "amps", target)
+	if err := a.setCurrent(target); err != nil {
+		return err
+	}
+	a.st.amps = target
+	a.persist()
+	return nil
+}
+
+// stopCharge drives the guaranteed-safe state: timed charge OFF, then current 0.
+// Disable FIRST (this is what actually halts grid charging), THEN zero the
+// current. Gated on mayWrite so the watchdog/reconcile/shutdown fail-safe may
+// call it in watchdog mode too. Idempotent: no writes when already confirmed off.
+//
+// st is cleared to not-charging after the writes are issued, even if the disable
+// read-back did not confirm. This is safe by eventual consistency: setTimedCharge
+// already retries-until-confirmed, and if it still failed, the idempotent guard
+// here (switch not off ⇒ re-issue) plus the watchdog's out-of-window disable
+// re-drive it on the next tick — while a stale st=charging would wrongly suppress
+// exactly that retry.
+func (a *Actuator) stopCharge(reason string) error {
 	if !a.mode.mayWrite() {
-		slog.Info("actuator: would fail-safe (no-op in current mode)", "reason", reason, "mode", a.mode)
+		slog.Info("actuator: would stop grid charge (no-op in current mode)", "reason", reason, "mode", a.mode)
 		return nil
 	}
-	priority := a.ha.State(a.cfg.OutputPrioritySelect)
-	suspect := force || a.ep.inBypass ||
-		priority == a.cfg.UtilityOption ||
-		priority == "" || priority == "unknown" || priority == "unavailable"
-	if !suspect {
-		a.ep.inBypass = false
-		return nil
+	if !a.st.charging && a.ha.State(a.cfg.TimedChargeSwitch) == switchOff {
+		return nil // already stopped and confirmed off — nothing to write
 	}
-	slog.Warn("actuator: FAIL-SAFE", "reason", reason, "priority", priority, "mode", a.mode)
+	slog.Info("actuator: STOP grid charge (timed charge off, current 0)", "reason", reason)
 	var errs []error
-	if err := a.writeAmps(0); err != nil {
+	// Disable FIRST.
+	if err := a.setTimedCharge(false); err != nil {
 		errs = append(errs, err)
 	}
-	// Space the SBU write (see doExit): a dropped SBU would leave the inverter
-	// stranded in bypass, the exact hazard the fail-safe exists to prevent.
 	a.pause()
-	if err := a.writePriority(a.cfg.BatteryOption); err != nil {
+	if err := a.setCurrent(0); err != nil {
 		errs = append(errs, err)
 	}
-	a.ep.inBypass = false
-	a.ep.amps = 0
-	a.ep.exited = true
-	a.stopBoundaryTimer()
+	a.st = chargeState{}
 	a.persist()
 	return errors.Join(errs...)
+}
+
+// windowWithinOffPeak is the hardware-rail guard on what is written to a
+// charge-window slot: it confirms the interval lies wholly within a single
+// configured off-peak window, so a peak interval can never be programmed as a
+// charge window. An inset off-peak window satisfies this by construction; the
+// check defends against a self-inconsistent config or an over-large inset.
+func (a *Actuator) windowWithinOffPeak(w config.TimeWindow) bool {
+	endMinus := todAddMinutes(w.End, -1)
+	for _, off := range a.rates.OffPeakWindows {
+		if off.Contains(w.Start) && off.Contains(endMinus) {
+			return true
+		}
+	}
+	return false
+}
+
+// midnightHHMM is the "HH:MM" the inverter may misread as a wrap / zero-length
+// window; a mirrored bound landing on it is skipped.
+const midnightHHMM = "00:00"
+
+// insetWindow shrinks w by inset at both ends: [start+inset, end−inset]. ok is
+// false when the window is shorter than 2×inset (the inset would collapse or
+// invert it). Handles a window that wraps past midnight.
+func insetWindow(w config.TimeWindow, inset time.Duration) (config.TimeWindow, bool) {
+	insetMin := int(inset / time.Minute)
+	if insetMin <= 0 {
+		return w, true
+	}
+	if windowMinutes(w) <= 2*insetMin {
+		return config.TimeWindow{}, false
+	}
+	return config.TimeWindow{
+		Start: todAddMinutes(w.Start, insetMin),
+		End:   todAddMinutes(w.End, -insetMin),
+		Rate:  w.Rate,
+	}, true
+}
+
+// windowMinutes is the length of w in minutes, treating end ≤ start as wrapping
+// past midnight.
+func windowMinutes(w config.TimeWindow) int {
+	d := (w.End.Hour*60 + w.End.Minute) - (w.Start.Hour*60 + w.Start.Minute)
+	if d <= 0 {
+		d += 24 * 60
+	}
+	return d
+}
+
+// todAddMinutes returns the time-of-day mins after t (mins may be negative),
+// wrapping within a 24h day.
+func todAddMinutes(t config.TimeOfDay, mins int) config.TimeOfDay {
+	m := ((t.Hour*60+t.Minute+mins)%(24*60) + 24*60) % (24 * 60)
+	return config.TimeOfDay{Hour: m / 60, Minute: m % 60}
 }
 
 // --- watchdog ---
@@ -701,265 +528,295 @@ func (a *Actuator) watchdogTicker(ctx context.Context) {
 	}
 }
 
-// handleWatchdog is the never-stuck-in-bypass safety net. It forces safe when the
-// inverter is in bypass outside every off-peak window, or when the state is
-// stale/unknown outside a window and bypass may be active (fail-safe).
+// handleWatchdog re-asserts the static window rail (self-healing a mid-life
+// scramble) and is the OUT-OF-WINDOW backstop for the new hazard: timed charge
+// left enabled outside every off-peak window (which would recur into future
+// windows, or persist a crashed daemon's charge). Inside a window the per-tick
+// policy path governs enable/disable, so the watchdog only re-asserts windows
+// there. Outside every window, timed charge must be OFF; if it reads on — or the
+// feed is stale/unknown so we cannot confirm it is off — disable it. Disabling is
+// always harmless, so there is no risk of an unwanted write.
 func (a *Actuator) handleWatchdog() error {
-	now := a.now()
-	_, inWindow := a.rates.ActiveWindow(now)
-	priority := a.ha.State(a.cfg.OutputPrioritySelect)
-	stale := !a.ha.Fresh(a.cfg.OutputPrioritySelect, a.cfg.StateStale.Duration) ||
-		priority == "" || priority == "unknown" || priority == "unavailable"
+	var errs []error
+	// Re-assert the static off-peak window rail idempotently (self-heals a mid-life
+	// window scramble). Cheap: it reads each slot and writes only on a mismatch.
+	if a.mode.mayWrite() {
+		if _, err := a.ensureWindowsMirrorOffPeak(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
-	stuckBypass := !inWindow && priority == a.cfg.UtilityOption
-	// H2: fail-safe on ANY stale feed outside a window — NOT gated on ep.inBypass.
-	// ep.inBypass can be false while the hardware is physically UTI (a failed or
-	// ambiguous enter), so a stale feed must never leave the inverter stranded. The
-	// doSafe(force=false) below still only WRITES when bypass is actually suspected
-	// (priority reads UTI/unknown/stale), so a genuinely-SBU inverter is not blipped.
-	failSafe := !inWindow && stale
-
-	if !stuckBypass && !failSafe {
-		return nil
+	if _, inWindow := a.rates.ActiveWindow(a.now()); inWindow {
+		return errors.Join(errs...)
+	}
+	state := a.ha.State(a.cfg.TimedChargeSwitch)
+	stale := !a.ha.Fresh(a.cfg.TimedChargeSwitch, a.cfg.StateStale.Duration) ||
+		state == "" || state == "unknown" || state == "unavailable"
+	if state != switchOn && !stale {
+		return errors.Join(errs...) // confirmed off outside every window — nothing to do
 	}
 	if !a.mode.mayWrite() {
-		slog.Warn("actuator: watchdog would fail-safe (no-op in current mode)",
-			"priority", priority, "in_window", inWindow, "stale", stale, "mode", a.mode)
-		return nil
+		slog.Warn("actuator: watchdog would disable timed charge (no-op in current mode)",
+			"switch", state, "stale", stale, "mode", a.mode)
+		return errors.Join(errs...)
 	}
-	reason := "watchdog: inverter in bypass outside off-peak window"
-	if failSafe {
-		reason = "watchdog: state stale/unknown outside window with bypass suspected"
+	reason := "watchdog: timed charge enabled outside off-peak window"
+	if stale {
+		reason = "watchdog: timed-charge feed stale/unknown outside off-peak window"
 	}
-	return a.doSafe(reason, false)
+	if err := a.stopCharge(reason); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // --- startup reconciliation ---
 
+// reconcile brings the inverter to the intended startup state. It (a) establishes
+// the static off-peak window rail (idempotent) and (b) ensures timed charge is
+// OFF. Per the safety model, at startup the actuator is NOT yet commanding a
+// charge (no fresh optimiser decision exists), so the intended switch state is
+// off; the first tick re-enables within one poll interval if the fresh solve wants
+// grid charge. Toggling timed charge is not a power blip, so this costs at most a
+// few minutes of deferred charging on restart, in exchange for never charging on
+// stale intent.
 func (a *Actuator) reconcile(ctx context.Context) error {
-	a.verifyOptions()
-
-	now := a.now()
-	priority := a.ha.State(a.cfg.OutputPrioritySelect)
-	win, inWindow := a.rates.ActiveWindow(now)
-
-	if priority != a.cfg.UtilityOption {
-		// Not in bypass. Reflect reality and keep the per-window budget only if the
-		// persisted state belongs to the current window (prevents a mid-window
-		// restart from re-spending an enter-blip); otherwise clear it.
-		a.ep.inBypass = false
-		if !inWindow || a.ep.windowID != win.ID {
-			a.ep = episode{}
-		}
-		slog.Info("actuator: startup reconcile — not in bypass",
-			"priority", priority, "in_window", inWindow, "mode", a.mode)
-		a.persist()
-		return nil
-	}
-
-	// priority == UTI (bypass).
-	if inWindow {
-		// Adopt an open episode: the enter-blip is already spent, so we must NOT
-		// re-enter. Preserve persisted counters if they match this window.
-		if a.ep.windowID != win.ID {
-			a.ep = episode{windowID: win.ID}
-		}
-		a.ep.inBypass = true
-		a.ep.entered = true
-		a.ep.amps = a.ha.StateFloat(a.cfg.MainsChargeCurrentNumber)
-		slog.Warn("actuator: startup reconcile — adopting open bypass episode",
-			"window", win.ID, "amps", a.ep.amps, "mode", a.mode)
-		if a.mode.mayWrite() {
-			a.armBoundary(win)
-		}
-		a.persist()
-		return nil
-	}
-
-	// UTI outside every window — unsafe; fail safe immediately.
-	slog.Warn("actuator: startup reconcile — UTI outside off-peak window; failing safe", "mode", a.mode)
 	_ = ctx
-	return a.doSafe("startup: UTI outside off-peak window", true)
+	a.verifyEntities()
+	a.st = chargeState{}
+	if !a.mode.mayWrite() {
+		slog.Info("actuator: startup reconcile (no-op in current mode)",
+			"mode", a.mode, "timed_charge", a.ha.State(a.cfg.TimedChargeSwitch))
+		return nil
+	}
+	slog.Info("actuator: startup reconcile — mirroring off-peak window rail, ensuring timed charge OFF",
+		"timed_charge", a.ha.State(a.cfg.TimedChargeSwitch), "mode", a.mode)
+	var errs []error
+	// Establish the static off-peak window rail first, then ensure the switch is off.
+	wrote, err := a.ensureWindowsMirrorOffPeak()
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if wrote {
+		a.pause()
+	}
+	if err := a.stopCharge("startup reconcile"); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
-// verifyOptions logs a warning if the configured UTI/SBU option strings are not
-// among the select entity's advertised options (best-effort).
-func (a *Actuator) verifyOptions() {
-	attrs := a.ha.Attributes(a.cfg.OutputPrioritySelect)
-	raw, ok := attrs["options"]
-	if !ok {
-		return
-	}
-	list, ok := raw.([]any)
-	if !ok {
-		return
-	}
-	have := make([]string, 0, len(list))
-	for _, o := range list {
-		if s, ok := o.(string); ok {
-			have = append(have, s)
-		}
-	}
-	var hasU, hasB bool
-	for _, s := range have {
-		if s == a.cfg.UtilityOption {
-			hasU = true
-		}
-		if s == a.cfg.BatteryOption {
-			hasB = true
-		}
-	}
-	if !hasU || !hasB {
-		slog.Warn("actuator: configured output_priority options not found on entity",
-			"utility", a.cfg.UtilityOption, "battery", a.cfg.BatteryOption, "available", have)
-	}
-}
-
-// --- boundary timer ---
-
-// armBoundary schedules the window-end exit via an explicit timer (independent of
-// the 5-minute tick, which could otherwise miss the boundary).
-func (a *Actuator) armBoundary(win config.OffPeakOccurrence) {
-	a.stopBoundaryTimer()
-	d := win.End.Sub(a.now())
-	if d < 0 {
-		d = 0
-	}
-	id := win.ID
-	a.boundaryTimer = time.AfterFunc(d, func() {
-		a.submitAsync(command{kind: cmdBoundary, windowID: id})
-	})
-}
-
-func (a *Actuator) stopBoundaryTimer() {
-	if a.boundaryTimer != nil {
-		a.boundaryTimer.Stop()
-		a.boundaryTimer = nil
-	}
-}
-
-// --- inverter writes (ack + read-back) ---
-
-// ackPriority issues the output_priority write and waits ONLY for Home
-// Assistant's correlated service ack (the `result` frame). The ack is the
-// authoritative "command accepted" signal; the echoed state read-back is a
-// separate, advisory step (see verifyPriority / doEnter C1).
-func (a *Actuator) ackPriority(option string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WriteTimeout.Duration)
-	defer cancel()
-	if err := a.ha.CallServiceAck(ctx, "select", "select_option", map[string]any{
-		"entity_id": a.cfg.OutputPrioritySelect,
-		"option":    option,
-	}); err != nil {
-		return fmt.Errorf("set output_priority=%s: %w", option, err)
-	}
-	return nil
-}
-
-// verifyPriority polls the state cache until the priority entity echoes option or
-// the configured read-back timeout elapses. ADVISORY: a non-nil result means the
-// echo lagged, not that the write failed — callers log it but must not reverse
-// state (the blip already happened).
-func (a *Actuator) verifyPriority(option string) error {
-	return a.verifyState(a.cfg.OutputPrioritySelect, option)
-}
-
-// writePriority sets output_priority (ack-confirmed) then does an advisory
-// read-back. Returns an error only when the service ack itself fails; a lagging
-// or missing state echo is logged, never propagated (used by exit/safe, where the
-// SBU direction is the safe one and a slow echo must not be reported as failure).
-func (a *Actuator) writePriority(option string) error {
-	if err := a.ackPriority(option); err != nil {
-		return err
-	}
-	if err := a.verifyPriority(option); err != nil {
-		slog.Warn("actuator: output_priority read-back did not confirm (advisory)",
-			"option", option, "error", err)
-	}
-	return nil
-}
-
-// writeAmps sets the per-unit mains charge current, confirmed via the ack frame.
-func (a *Actuator) writeAmps(amps float64) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WriteTimeout.Duration)
-	defer cancel()
-	val := round1(amps)
-	if err := a.ha.CallServiceAck(ctx, "number", "set_value", map[string]any{
-		"entity_id": a.cfg.MainsChargeCurrentNumber,
-		"value":     val,
-	}); err != nil {
-		return fmt.Errorf("set mains_charge_current=%.1f: %w", val, err)
-	}
-	return nil
-}
-
-// ampsConfirmed reports whether the mains-charge-current read-back currently
-// reflects the commanded setpoint (within adjustEpsilon). It is a SINGLE,
-// non-blocking check — the enter's amps read-back is polled by the loop's service
-// tick (servicePending / phaseConfirm), never by a blocking sleep-loop on the
-// write-owning goroutine. This replaces the former ampsLanded blocking poll,
-// which monopolised the loop for up to the settle timeout.
-func (a *Actuator) ampsConfirmed(want float64) bool {
-	target := round1(want)
-	return math.Abs(a.ha.StateFloat(a.cfg.MainsChargeCurrentNumber)-target) < adjustEpsilon
-}
-
-// pause spaces two consecutive inverter writes (the SRNE "space writes"
-// requirement). It sleeps the settle delay; the loop goroutine is the sole writer
-// so blocking it briefly is safe (async watchdog/boundary commands buffer). It
-// returns early on a.closed so a normal transition's spacing does not wedge
-// shutdown — EXCEPT on the loop's shutdown path (duringShutdown), where the full
-// spacing is honoured so the final SBU write is never dropped by the controller.
-func (a *Actuator) pause() {
-	if a.settleDelay <= 0 {
-		return
-	}
-	if a.duringShutdown {
-		time.Sleep(a.settleDelay)
-		return
-	}
-	t := time.NewTimer(a.settleDelay)
-	defer t.Stop()
-	select {
-	case <-t.C:
-	case <-a.closed:
-	}
-}
-
-// verifyState polls the state cache until the entity reports want, or the
-// configured (advisory) read-back timeout elapses.
-func (a *Actuator) verifyState(entityID, want string) error {
-	return a.pollState(entityID, want, a.cfg.ReadBackTimeout.Duration, 50*time.Millisecond)
-}
-
-// pollState polls the state cache until the entity reports want, or timeout
-// elapses. It bounds on REAL elapsed time (not the injectable clock) so it
-// terminates deterministically even under a frozen test clock — the poll tracks
-// real device state-propagation latency. It also returns promptly on a.closed so
-// an advisory read-back cannot wedge shutdown — EXCEPT on the loop's shutdown path
-// (duringShutdown), where the final safe's read-back is allowed to run to its
-// bound. Used both for the advisory exit/safe read-back (short ReadBackTimeout)
-// and (historically) the enter settle-wait.
-func (a *Actuator) pollState(entityID, want string, timeout, poll time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		if got := a.ha.State(entityID); got == want {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("read-back %s: want %q, have %q", entityID, want, a.ha.State(entityID))
-		}
-		if a.duringShutdown {
-			time.Sleep(poll)
+// verifyEntities logs a best-effort warning for any configured actuation entity
+// that has no state yet (typo or a not-yet-available entity).
+func (a *Actuator) verifyEntities() {
+	ids := append([]string{a.cfg.TimedChargeSwitch, a.cfg.MainsChargeCurrentNumber}, a.windowEntityIDs()...)
+	for _, id := range ids {
+		if id == "" {
+			slog.Warn("actuator: a configured actuation entity ID is empty")
 			continue
 		}
-		t := time.NewTimer(poll)
+		if a.ha.State(id) == "" {
+			slog.Warn("actuator: configured entity has no state yet (may be unavailable)", "entity", id)
+		}
+	}
+}
+
+// --- inverter writes (spaced, confirmed, retried) ---
+
+// callAck issues one HA service call bounded by WriteTimeout.
+func (a *Actuator) callAck(domain, service string, data map[string]any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WriteTimeout.Duration)
+	defer cancel()
+	return a.ha.CallServiceAck(ctx, domain, service, data)
+}
+
+// writeConfirmed issues a write then polls the read-back until confirmed, retrying
+// (spaced) up to maxWriteRetries times to defeat the SRNE's dropped-write
+// behaviour. Re-issuing is safe here: these writes are idempotent and NOT power
+// blips, so retry-until-confirmed carries no double-spend hazard.
+func (a *Actuator) writeConfirmed(desc string, write func() error, confirmed func() bool) error {
+	var err error
+	for attempt := 0; attempt <= maxWriteRetries; attempt++ {
+		if attempt > 0 {
+			slog.Warn("actuator: write not confirmed — retrying (spaced)", "write", desc, "attempt", attempt)
+			a.pause()
+		}
+		if err = write(); err != nil {
+			continue
+		}
+		if a.awaitConfirmed(confirmed) {
+			return nil
+		}
+		err = fmt.Errorf("actuator: %s not confirmed within %s", desc, a.confirmTimeout)
+	}
+	return err
+}
+
+// setTimedCharge enables/disables the grid timed-charge switch, confirmed via
+// read-back.
+func (a *Actuator) setTimedCharge(on bool) error {
+	service, want := "turn_off", switchOff
+	if on {
+		service, want = "turn_on", switchOn
+	}
+	return a.writeConfirmed("timed_charge="+want,
+		func() error {
+			return a.callAck(switchDomain, service, map[string]any{"entity_id": a.cfg.TimedChargeSwitch})
+		},
+		func() bool { return a.ha.State(a.cfg.TimedChargeSwitch) == want },
+	)
+}
+
+// setCurrent sets the per-unit mains charge current (A), confirmed via read-back.
+func (a *Actuator) setCurrent(amps float64) error {
+	val := round1(amps)
+	return a.writeConfirmed(fmt.Sprintf("mains_charge_current=%.1f", val),
+		func() error {
+			return a.callAck(numberDomain, "set_value", map[string]any{
+				"entity_id": a.cfg.MainsChargeCurrentNumber,
+				"value":     val,
+			})
+		},
+		func() bool {
+			return math.Abs(a.ha.StateFloat(a.cfg.MainsChargeCurrentNumber)-val) < adjustEpsilon
+		},
+	)
+}
+
+// setWindowText writes one charge-window bound ("HH:MM"), confirmed via read-back.
+func (a *Actuator) setWindowText(entityID, hhmm string) error {
+	return a.writeConfirmed(fmt.Sprintf("%s=%s", entityID, hhmm),
+		func() error {
+			return a.callAck(textDomain, "set_value", map[string]any{
+				"entity_id": entityID,
+				"value":     hhmm,
+			})
+		},
+		func() bool { return a.ha.State(entityID) == hhmm },
+	)
+}
+
+// ensureWindowsMirrorOffPeak programs the inverter's charge-window slots to
+// STATICALLY mirror the configured off-peak periods (slot i ← off-peak window i),
+// inset by WindowInset at both ends — the hardware rail. Idempotent: a slot bound
+// is written only when its read-back differs from the intended value, so a steady
+// state issues no writes and there is no churn. Slots WITHOUT a corresponding
+// off-peak window are left UNTOUCHED (never zeroed): the global enable switch, off
+// outside off-peak, governs whether charging happens. A slot is SKIPPED (logged)
+// when the off-peak window is shorter than 2×inset, when the inset interval is not
+// wholly off-peak (windowWithinOffPeak guard), or when a mirrored bound would land
+// on 00:00 (which the inverter may misread as a wrap / zero-length window).
+// Returns whether any write was issued (so the caller can space a following write)
+// plus any error.
+func (a *Actuator) ensureWindowsMirrorOffPeak() (bool, error) {
+	windows := a.rates.OffPeakWindows
+	if len(windows) > len(a.cfg.ChargeWindows) {
+		slog.Warn("actuator: more off-peak windows than inverter charge-window slots — "+
+			"the excess periods have no charge window and cannot be grid-charged",
+			"off_peak_windows", len(windows), "slots", len(a.cfg.ChargeWindows))
+	}
+
+	inset := a.cfg.WindowInset.Duration
+	var errs []error
+	wrote := false
+	for i, slot := range a.cfg.ChargeWindows {
+		if i >= len(windows) {
+			break // no off-peak period for this slot — leave it untouched
+		}
+		w := windows[i]
+
+		insetW, ok := insetWindow(w, inset)
+		if !ok {
+			slog.Warn("actuator: off-peak window shorter than 2×inset — skipping charge-window slot",
+				"slot", i+1, "start", w.Start, "end", w.End, "inset", inset)
+			continue
+		}
+		if !a.windowWithinOffPeak(insetW) {
+			slog.Error("actuator: RAIL — refusing to program a charge-window slot with a "+
+				"non-off-peak interval", "slot", i+1, "start", insetW.Start, "end", insetW.End)
+			continue
+		}
+		startHHMM, endHHMM := insetW.Start.String(), insetW.End.String()
+		if startHHMM == midnightHHMM || endHHMM == midnightHHMM {
+			slog.Warn("actuator: mirrored charge window would write a 00:00 (midnight) bound — "+
+				"skipping charge-window slot to avoid a wrap/zero-length misread",
+				"slot", i+1, "start", startHHMM, "end", endHHMM)
+			continue
+		}
+
+		for _, wr := range [...]struct{ entity, want string }{
+			{slot.Start, startHHMM},
+			{slot.End, endHHMM},
+		} {
+			if wr.entity == "" || a.ha.State(wr.entity) == wr.want {
+				continue // unset entity, or already correct — no write, no spacing
+			}
+			if wrote {
+				a.pause()
+			}
+			if err := a.setWindowText(wr.entity, wr.want); err != nil {
+				errs = append(errs, err)
+			}
+			wrote = true
+		}
+	}
+	return wrote, errors.Join(errs...)
+}
+
+func (a *Actuator) windowEntityIDs() []string {
+	ids := make([]string, 0, len(a.cfg.ChargeWindows)*2)
+	for _, slot := range a.cfg.ChargeWindows {
+		ids = append(ids, slot.Start, slot.End)
+	}
+	return ids
+}
+
+// awaitConfirmed polls confirmed() until true or the confirm timeout elapses. It
+// bounds on REAL wall-clock (device echo latency is physical, not the test clock)
+// and returns promptly on close — except during the shutdown fail-safe, where the
+// disable must be allowed to confirm.
+func (a *Actuator) awaitConfirmed(confirmed func() bool) bool {
+	deadline := time.Now().Add(a.confirmTimeout)
+	for {
+		if confirmed() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		if a.duringShutdown {
+			time.Sleep(a.confirmPoll)
+			continue
+		}
+		t := time.NewTimer(a.confirmPoll)
 		select {
 		case <-t.C:
 		case <-a.closed:
 			t.Stop()
-			return fmt.Errorf("read-back %s aborted: actuator closing (advisory)", entityID)
+			return confirmed()
 		}
+	}
+}
+
+// pause spaces two consecutive inverter writes (the SRNE "space writes"
+// requirement). The loop goroutine is the sole writer so blocking it briefly is
+// safe (async watchdog commands buffer). It returns early on a.closed so a normal
+// transition's spacing does not wedge shutdown — EXCEPT on the shutdown path
+// (duringShutdown), where the full spacing is honoured so the final disable write
+// is never dropped.
+func (a *Actuator) pause() {
+	if a.spacing <= 0 {
+		return
+	}
+	if a.duringShutdown {
+		time.Sleep(a.spacing)
+		return
+	}
+	t := time.NewTimer(a.spacing)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-a.closed:
 	}
 }
 
@@ -969,20 +826,18 @@ func (a *Actuator) pollState(entityID, want string, timeout, poll time.Duration)
 // commanded gridKW is first clamped to the AGGREGATE pack ceiling (MaxChargeKW)
 // so a high per-unit amp headroom can never exceed pack acceptance; the per-unit
 // MaxChargeCurrentA then bounds the result a second time. Uses the live pack
-// voltage when fresh AND plausible, nominal otherwise.
+// voltage when fresh AND plausible, nominal otherwise. mains_charge_current is
+// per-inverter, so the two parallel units double the delivered current — the
+// division by NumUnits is what makes the confirmed-live 6 kW draw correct.
 func (a *Actuator) kwToAmps(gridKW float64) float64 {
 	if gridKW <= 0 {
 		return 0
 	}
-	// M6: aggregate-kW ceiling BEFORE the per-unit conversion.
 	if a.cfg.MaxChargeKW > 0 && gridKW > a.cfg.MaxChargeKW {
 		gridKW = a.cfg.MaxChargeKW
 	}
 	v := a.battery.NominalVoltageV
 	if a.ha.Fresh(a.cfg.BatteryVoltageSensor, a.cfg.VoltageStale.Duration) {
-		// M6: a fresh but implausibly-low reading (glitched sensor) would inflate
-		// amps toward the ceiling — treat anything below minPlausibleVoltageV as
-		// use-nominal.
 		if live := a.ha.StateFloat(a.cfg.BatteryVoltageSensor); live >= minPlausibleVoltageV {
 			v = live
 		}
@@ -1006,22 +861,16 @@ func (a *Actuator) kwToAmps(gridKW float64) float64 {
 
 // --- persistence ---
 
+// persistState records the actuator's charge intent across restarts. It is
+// INFORMATIONAL, not safety-critical: reconcile disables timed charge on every
+// start regardless, so a lost/corrupt file only affects logging, never safety.
 type persistState struct {
-	WindowID string  `json:"window_id"`
-	Entered  bool    `json:"entered"`
-	Exited   bool    `json:"exited"`
-	InBypass bool    `json:"in_bypass"`
+	Charging bool    `json:"charging"`
 	Amps     float64 `json:"amps"`
 }
 
 func (a *Actuator) persistPath() string {
-	return filepath.Join(a.cfg.StateDir, "actuator_episode.json")
-}
-
-// setEpisode replaces the episode and persists.
-func (a *Actuator) setEpisode(ep episode) {
-	a.ep = ep
-	a.persist()
+	return filepath.Join(a.cfg.StateDir, "actuator_charge.json")
 }
 
 func (a *Actuator) persist() {
@@ -1029,28 +878,22 @@ func (a *Actuator) persist() {
 		return
 	}
 	data, err := json.Marshal(persistState{
-		WindowID: a.ep.windowID,
-		Entered:  a.ep.entered,
-		Exited:   a.ep.exited,
-		InBypass: a.ep.inBypass,
-		Amps:     a.ep.amps,
+		Charging: a.st.charging,
+		Amps:     a.st.amps,
 	})
 	if err != nil {
 		return
 	}
 	if err := atomicWriteFile(a.persistPath(), data, 0o644); err != nil {
-		slog.Warn("actuator: persist episode failed", "error", err)
+		slog.Warn("actuator: persist charge state failed", "error", err)
 	}
 }
 
 // atomicWriteFile writes data to a temp file in the SAME directory, fsyncs it,
-// then renames it over path. A crash mid-write therefore never truncates or tears
-// the blip-budget record — loadPersist either sees the prior valid file or the
-// fully-written new one, so "entered+exited" can never be mistaken for "never
-// entered" (which would re-spend an enter-blip in the same window on restart).
+// then renames it over path, so a crash mid-write never leaves a torn file.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".actuator-episode-*.tmp")
+	tmp, err := os.CreateTemp(dir, ".actuator-charge-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -1094,12 +937,9 @@ func (a *Actuator) loadPersist() {
 	if err := json.Unmarshal(data, &ps); err != nil {
 		return
 	}
-	a.ep = episode{
-		windowID: ps.WindowID,
-		inBypass: ps.InBypass,
+	a.st = chargeState{
+		charging: ps.Charging,
 		amps:     ps.Amps,
-		entered:  ps.Entered,
-		exited:   ps.Exited,
 	}
 }
 

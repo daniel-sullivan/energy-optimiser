@@ -295,28 +295,48 @@ func (m MQTT) StateTopic(component, key string) string {
 	return fmt.Sprintf("%s/%s/%s/%s/state", m.TopicPrefix, component, m.DeviceID, key)
 }
 
-// ActuatorHW configures the Phase-1 blip-safe grid-charge actuator: the HA
-// entities it writes/reads and the kW→A conversion. The only working grid-charge
-// path on this ASP/SRNE inverter is output_priority→UTI (utility bypass, one
-// power blip) then mains_charge_current > 0; rate changes are amps-only (no
-// blip); exit is output_priority→SBU (one blip). Entity IDs are config-driven
-// with sensible SRNE-add-on defaults.
+// ChargeWindowEntities are the "HH:MM" start/end text entity IDs for one
+// inverter timed-charge window slot.
+type ChargeWindowEntities struct {
+	Start string `toml:"start"`
+	End   string `toml:"end"`
+}
+
+// ActuatorHW configures the timed-charge grid-charge actuator: the HA entities it
+// writes/reads and the kW→A conversion. The ONLY working grid-charge path on this
+// ASP/SRNE inverter (confirmed live) is the timed-charge mechanism: enable
+// TimedChargeSwitch while inside a programmed ChargeWindow, with
+// MainsChargeCurrentNumber > 0, to draw grid charge; disable the switch to stop.
+// Toggling it is NOT a power blip. Entity IDs are config-driven with sensible
+// SRNE-add-on defaults.
 type ActuatorHW struct {
-	// OutputPrioritySelect is the select entity toggling bypass (UTI) vs
-	// battery-priority (SBU). Writing it is the ONLY operation that blips power.
-	OutputPrioritySelect string `toml:"output_priority_select"`
+	// TimedChargeSwitch enables/disables grid timed-charging — the sole grid-charge
+	// gate. The actuator guarantees it is OFF whenever it is not actively
+	// commanding a charge.
+	TimedChargeSwitch string `toml:"timed_charge_switch"`
 	// MainsChargeCurrentNumber is the per-unit grid-charge current (A) number
-	// entity. Changing it while already in bypass is blip-free.
+	// entity. It is adjustable live while timed charge is enabled.
 	MainsChargeCurrentNumber string `toml:"mains_charge_current_number"`
 	// BatteryVoltageSensor is the live pack-voltage sensor used for kW→A; falls
 	// back to Battery.NominalVoltageV when stale/unavailable.
 	BatteryVoltageSensor string `toml:"battery_voltage_sensor"`
 
-	// UtilityOption / BatteryOption are the exact select option strings for
-	// bypass and battery-priority. Verified against the select's options at
-	// runtime; these are defaults only.
-	UtilityOption string `toml:"utility_option"`
-	BatteryOption string `toml:"battery_option"`
+	// ChargeWindows are the inverter's timed-charge window slots (start/end "HH:MM"
+	// text entities). They are a STATIC HARDWARE RAIL: grid charging can only occur
+	// inside a programmed window, so the actuator mirrors slot i to configured
+	// off-peak window i (idempotently — only writing on a mismatch) and never
+	// programs a peak interval. Slots without a corresponding off-peak window are
+	// left untouched; the global timed-charge switch (off outside off-peak) governs
+	// whether charging actually happens.
+	ChargeWindows []ChargeWindowEntities `toml:"charge_windows"`
+
+	// WindowInset shrinks each mirrored charge window by this much at BOTH ends
+	// (slot = [offpeak.start + inset, offpeak.end − inset]) — a guard against
+	// inverter/tariff clock skew so hardware charging can never leak into peak.
+	// Default 5m. A window shorter than 2×inset is skipped (logged), as is any
+	// mirrored bound that would land on 00:00 (which the inverter may misread as a
+	// wrap / zero-length window).
+	WindowInset Duration `toml:"window_inset"`
 
 	// NumUnits is the count of parallel inverter units the per-unit current is
 	// applied to (the pack current is NumUnits × per-unit amps).
@@ -329,24 +349,28 @@ type ActuatorHW struct {
 	// 8 kW when that too is unset). Bounds the per-unit clamp as a second limit.
 	MaxChargeKW float64 `toml:"max_charge_kw"`
 
-	// StateDir persists the per-window blip-budget episode so a mid-window
-	// restart cannot spend a second enter-blip.
+	// StateDir persists the actuator's charge intent across restarts. This is
+	// informational only: reconcile disables timed charge on every start, so a
+	// lost/corrupt file never affects safety.
 	StateDir string `toml:"state_dir"`
 
-	// WatchdogInterval is the cadence of the independent never-stuck-in-bypass
-	// safety check. WriteTimeout bounds each inverter write+ack.
+	// WatchdogInterval is the cadence of the independent never-charging-outside-
+	// off-peak safety check. WriteTimeout bounds each inverter write+ack.
 	WatchdogInterval Duration `toml:"watchdog_interval"`
 	WriteTimeout     Duration `toml:"write_timeout"`
 
-	// ReadBackTimeout bounds the ADVISORY state-cache poll that confirms an
-	// output_priority write echoed back. It is not blip-critical (the service ack
-	// is authoritative); it MUST exceed real device state-propagation latency so a
-	// slow echo is not mistaken for a failed write. Default 8s.
+	// ReadBackTimeout bounds the state-cache poll that confirms an inverter write
+	// echoed back before it is retried. It MUST comfortably exceed real device
+	// state-propagation latency so a slow echo is not mistaken for a dropped write.
+	// The SRNE timed-charge switch/number/text entities echo ~20-40s after the
+	// service ack (measured live), so the default is 45s — tune up if your feed is
+	// slower. Too short here causes every legitimate write to time out and churn
+	// spurious retries.
 	ReadBackTimeout Duration `toml:"read_back_timeout"`
 
 	// VoltageStale marks the battery-voltage reading stale (→ nominal fallback)
-	// past this age; StateStale marks the output-priority reading stale (→
-	// watchdog fail-safe) past this age.
+	// past this age; StateStale marks the timed-charge switch reading stale (→
+	// watchdog disables it outside a window) past this age.
 	VoltageStale Duration `toml:"voltage_stale"`
 	StateStale   Duration `toml:"state_stale"`
 }
@@ -560,13 +584,13 @@ func (c *Config) validateTelescopingGrid() error {
 	return nil
 }
 
-// finalizeActuator fills the Phase-1 actuator defaults. Entity IDs default to
-// the standard SRNE-add-on aggregate entities (the same srne_system device the
+// finalizeActuator fills the timed-charge actuator defaults. Entity IDs default
+// to the standard SRNE-add-on aggregate entities (the same srne_system device the
 // MQTT actuation targets); StateDir shares the PV model's persistence dir.
 func (c *Config) finalizeActuator() {
 	a := &c.ActuatorHW
-	if a.OutputPrioritySelect == "" {
-		a.OutputPrioritySelect = "select.srne_solar_system_output_priority"
+	if a.TimedChargeSwitch == "" {
+		a.TimedChargeSwitch = "switch.srne_solar_system_timed_charge_grid"
 	}
 	if a.MainsChargeCurrentNumber == "" {
 		a.MainsChargeCurrentNumber = "number.srne_solar_system_mains_charge_current"
@@ -574,11 +598,12 @@ func (c *Config) finalizeActuator() {
 	if a.BatteryVoltageSensor == "" {
 		a.BatteryVoltageSensor = "sensor.srne_solar_system_battery_voltage"
 	}
-	if a.UtilityOption == "" {
-		a.UtilityOption = "UTI"
-	}
-	if a.BatteryOption == "" {
-		a.BatteryOption = "SBU"
+	if len(a.ChargeWindows) == 0 {
+		a.ChargeWindows = []ChargeWindowEntities{
+			{Start: "text.srne_solar_system_charge_window_1_start", End: "text.srne_solar_system_charge_window_1_end"},
+			{Start: "text.srne_solar_system_charge_window_2_start", End: "text.srne_solar_system_charge_window_2_end"},
+			{Start: "text.srne_solar_system_charge_window_3_start", End: "text.srne_solar_system_charge_window_3_end"},
+		}
 	}
 	if a.NumUnits == 0 {
 		a.NumUnits = 2
@@ -598,11 +623,16 @@ func (c *Config) finalizeActuator() {
 	if a.WatchdogInterval.Duration == 0 {
 		a.WatchdogInterval.Duration = 30 * time.Second
 	}
+	if a.WindowInset.Duration == 0 {
+		a.WindowInset.Duration = 5 * time.Minute
+	}
 	if a.WriteTimeout.Duration == 0 {
 		a.WriteTimeout.Duration = 10 * time.Second
 	}
 	if a.ReadBackTimeout.Duration == 0 {
-		a.ReadBackTimeout.Duration = 8 * time.Second
+		// SRNE echo/apply lag is ~20-40s for these entities; 45s gives margin so a
+		// legitimate write confirms on its first landing rather than churning retries.
+		a.ReadBackTimeout.Duration = 45 * time.Second
 	}
 	if a.VoltageStale.Duration == 0 {
 		a.VoltageStale.Duration = 5 * time.Minute

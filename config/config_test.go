@@ -144,6 +144,20 @@ func TestParse(t *testing.T) {
 	if cfg.InfluxDB.Measurements.Power != "W" {
 		t.Errorf("power measurement = %q, want W", cfg.InfluxDB.Measurements.Power)
 	}
+
+	// Actuator (timed-charge) defaults.
+	if cfg.ActuatorHW.ReadBackTimeout.Duration != 45*time.Second {
+		t.Errorf("read_back_timeout default = %v, want 45s", cfg.ActuatorHW.ReadBackTimeout)
+	}
+	if cfg.ActuatorHW.WindowInset.Duration != 5*time.Minute {
+		t.Errorf("window_inset default = %v, want 5m", cfg.ActuatorHW.WindowInset)
+	}
+	if cfg.ActuatorHW.TimedChargeSwitch != "switch.srne_solar_system_timed_charge_grid" {
+		t.Errorf("timed_charge_switch default = %q", cfg.ActuatorHW.TimedChargeSwitch)
+	}
+	if len(cfg.ActuatorHW.ChargeWindows) != 3 {
+		t.Errorf("charge_windows default = %d, want 3", len(cfg.ActuatorHW.ChargeWindows))
+	}
 }
 
 func TestRateAt(t *testing.T) {
