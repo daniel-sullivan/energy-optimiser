@@ -87,6 +87,12 @@ confidence_threshold = 0.3  # below this, use conservative defaults
 min_charge_kw = 1.0         # a grid-charge permit must yield >= this (no empty-bypass)
 blip_cost = 5.0             # currency penalty per bypass entry (skips marginal windows)
 
+# [load_model]
+# lookback_days = 30            # training window; also the SHAPE/percentile window
+# recency_half_life_days = 3    # LEVEL recency decay — a baseline step-change is tracked within days
+# percentile = 0.75             # per-bucket SHAPE percentile (vs mean) — p75 headroom against spiky loads
+# conservative_margin = 1.3     # multiplies a low-confidence bucket's prediction (+30%)
+
 # [pv_model]
 # max_pv_kw = 25            # physical ceiling (kW) on the learned far-horizon PV model; 0/unset = unbounded.
 #                           # Set it to a generous multiple of your inverter AC cap so a stuck or

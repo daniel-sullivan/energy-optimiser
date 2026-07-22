@@ -163,7 +163,7 @@ The dashboard is available at `http://localhost:8080` (or whatever
 | `cmd/` | Cobra CLI: `serve`, `backtest`, `verify` |
 | `config/` | TOML configuration structs, secret indirection, tariff-window logic |
 | `forecast/` | Solcast solar forecast client (multi-site, cached); Open-Meteo weather client |
-| `loadmodel/` | Per-slot load prediction from hour × day-of-week × season buckets, trained from the time-series store, with a data-coverage confidence score |
+| `loadmodel/` | Per-slot load prediction: recency-weighted level × percentile-headroom shape per hour × day-of-week × season bucket, trained from the time-series store, with a data-coverage + distribution-shift confidence score |
 | `optimizer/` | go-milp problem builder, solver, typed schedule extraction |
 | `influx/` | Time-series client: queries via `/api/v1/export`, writes via InfluxDB line protocol |
 | `ha/` | Home Assistant WebSocket client: state subscriptions, service calls |

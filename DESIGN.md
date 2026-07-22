@@ -81,12 +81,24 @@ samples, bucketed by:
 - **Fixed** categories: `hour × season`
 - **Routine** categories: `hour × day-of-week × season`
 
-Each bucket stores a running mean; prediction looks up the bucket for the
-target slot's time, falling back to a day-of-week-agnostic bucket and then a
-conservative default if a bucket has fewer than 3 samples. A **confidence**
-score (fraction of hour×season — or hour×dow×season — buckets with enough
-data) gates how much the dashboard and rationale trust the model; a `weather`
-circuit category and per-circuit deferrable-load splitting exist as
+Each bucket predicts a **LEVEL × SHAPE** product rather than a flat mean over
+the whole lookback window (which dilutes a real step-change in household
+baseline — e.g. a doubled load over a few days gets averaged against 30 days
+of the old baseline): LEVEL is an exponentially recency-decayed mean across
+all samples (`recency_half_life_days`, default 3), tracking the current
+baseline within days; SHAPE is each bucket's high-percentile
+(`percentile`, default p75) relative to the wide-window overall mean, so
+peaky hour-of-day patterns bias predictions up instead of averaging spikes
+away. Prediction looks up the bucket for the target slot's time, falling back
+to a day-of-week-agnostic bucket and then the recency-tracked LEVEL (or a
+hardcoded default with no data at all) if a bucket has fewer than 3 samples.
+A per-bucket **confidence** score (sample-count coverage × a distribution-
+shift signal — how far the recency LEVEL has drifted from the wide-window
+mean) gates `optimizer.confidence_threshold`: a low-confidence bucket's
+prediction is scaled up by `load_model.conservative_margin` rather than
+trusted as-is. The same shift-aware score feeds `Model.Confidence()` (the
+dashboard/rationale score); a `weather` circuit category and per-circuit
+deferrable-load splitting exist as
 extension points but aren't populated by the current training loop.
 
 ## MILP Formulation

@@ -81,10 +81,16 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		return nil, fmt.Errorf("actuator mode: %w", err)
 	}
 	h := &Hub{
-		cfg:         cfg,
-		solcast:     forecast.NewSolcast(cfg.Solcast),
-		weather:     forecast.NewWeather(cfg.Weather),
-		loadModel:   loadmodel.New(cfg.Circuits, cfg.HomeAssistant.Entities.LoadPower),
+		cfg:     cfg,
+		solcast: forecast.NewSolcast(cfg.Solcast),
+		weather: forecast.NewWeather(cfg.Weather),
+		loadModel: loadmodel.New(cfg.Circuits, cfg.HomeAssistant.Entities.LoadPower, loadmodel.Params{
+			SouthernHemisphere:  cfg.Weather.Latitude < 0,
+			RecencyHalfLifeDays: cfg.LoadModel.RecencyHalfLifeDays,
+			Percentile:          cfg.LoadModel.Percentile,
+			ConfidenceThreshold: cfg.Optimizer.ConfidenceThreshold,
+			ConservativeMargin:  cfg.LoadModel.ConservativeMargin,
+		}),
 		ha:          ha.New(cfg.HomeAssistant),
 		dryRun:      dryRun,
 		mode:        mode,
@@ -197,7 +203,8 @@ func (h *Hub) Run(ctx context.Context) error {
 	// Train load model (skip if no InfluxDB)
 	if h.influx != nil {
 		slog.Info("training load model")
-		if err := h.loadModel.Train(ctx, &loadDataSource{h.influx}, 30*24*time.Hour); err != nil {
+		lookback := time.Duration(h.cfg.LoadModel.LookbackDays*24) * time.Hour
+		if err := h.loadModel.Train(ctx, &loadDataSource{h.influx}, lookback); err != nil {
 			slog.Warn("load model training incomplete", "error", err)
 		}
 		slog.Info("load model ready", "confidence", fmt.Sprintf("%.2f", h.loadModel.Confidence()))

@@ -35,7 +35,7 @@ dashboard internals.
 - `cmd/` — Cobra CLI: `serve`, `backtest`, `verify`, config loading
 - `config/` — TOML configuration structs (battery, rates, loads, services), secret indirection (`env:VARNAME`), tariff-window logic
 - `forecast/` — Solcast solar forecast client (multi-site, cached) + Open-Meteo weather client (fetched, not yet wired into the load model)
-- `loadmodel/` — hour×dow×season bucket load profiles, trained from the time-series store, cold-start safe with a data-coverage confidence score
+- `loadmodel/` — hour×dow×season bucket load profiles (recency-weighted level × percentile-headroom shape), trained from the time-series store, cold-start safe with a data-coverage + distribution-shift confidence score
 - `optimizer/` — go-milp problem builder, solver, typed schedule extraction
 - `influx/` — time-series client (VictoriaMetrics / any InfluxDB-line-protocol-compatible store): `/api/v1/export` queries, line-protocol writes
 - `ha/` — Home Assistant WebSocket client (state subscriptions, service calls)
@@ -47,7 +47,7 @@ dashboard internals.
 ### Key Design Decisions
 
 - **MILP via go-milp** — pure Go, zero cgo, zero third-party runtime dependencies. 72h rolling horizon, 30-min slots, re-solved every `poll_interval` (default 5 min). Binary grid-charge permit per off-peak slot (fixed to 0 in peak slots), continuous battery flow, piecewise-linear SOC-risk penalties, a per-off-peak-window bypass-entry budget (`Σstart ≤ 1`) plus a blip-cost objective term to avoid inverter mode-chatter.
-- **Cold start** — the system is useful from day one with conservative defaults. Load-model confidence (based on bucket data coverage) gates how aggressively the optimiser departs from safe fallbacks.
+- **Cold start** — the system is useful from day one with conservative defaults. Load-model confidence (bucket data coverage × a recency-vs-history distribution-shift signal) gates `optimizer.confidence_threshold`, scaling up a low-confidence bucket's prediction rather than trusting it as-is.
 - **Time-series store as the data layer** — HA pushes sensor history in; the service reads it for load-model training and `backtest`, and writes optimizer decisions back for auditing. Package is named `influx/` for historical reasons (migrated InfluxDB → VictoriaMetrics); both speak the same wire protocol.
 - **HA WebSocket for live state** — SOC/PV/grid/load/battery-power subscriptions and service calls through one persistent connection; history is never read this way.
 - **Actuator never speaks inverter protocol** — it only flips an existing MQTT "charge from mains" switch published by a separate inverter controller. The decision publisher writes to its own, distinct MQTT-discovery device so it never collides with or overwrites the controller's entities.

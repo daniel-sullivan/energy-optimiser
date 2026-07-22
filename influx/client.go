@@ -85,7 +85,10 @@ func (c *Client) QueryPercentage(ctx context.Context, entityID string, from, to 
 func (c *Client) querySeries(ctx context.Context, unit, entityID string, from, to time.Time) ([]Sample, error) {
 	metric := unit + "_value"
 	short := shortEntityID(entityID)
-	match := fmt.Sprintf(`{__name__=%q,entity_id=%q}`, metric, short)
+	// domain="sensor" is defense-in-depth: entity_id alone is the HA short id
+	// (domain stripped), so a future switch/number entity that happens to
+	// share a sensor's short id would otherwise silently match too.
+	match := fmt.Sprintf(`{__name__=%q,entity_id=%q,domain="sensor"}`, metric, short)
 
 	q := url.Values{}
 	q.Set("match[]", match)

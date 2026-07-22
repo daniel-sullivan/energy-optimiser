@@ -18,6 +18,7 @@ type Config struct {
 	Battery       Battery       `toml:"battery"`
 	Rates         Rates         `toml:"rates"`
 	Optimizer     Optimizer     `toml:"optimizer"`
+	LoadModel     LoadModel     `toml:"load_model"`
 	PVModel       PVModel       `toml:"pv_model"`
 	MQTT          MQTT          `toml:"mqtt"`
 	ActuatorHW    ActuatorHW    `toml:"actuator"`
@@ -232,7 +233,10 @@ func (r *Rates) ActiveWindow(t time.Time) (OffPeakOccurrence, bool) {
 }
 
 type Optimizer struct {
-	SOCRiskWeight       float64 `toml:"soc_risk_weight"`
+	SOCRiskWeight float64 `toml:"soc_risk_weight"`
+	// ConfidenceThreshold: below this, a load-model bucket's prediction is
+	// scaled up by LoadModel.ConservativeMargin rather than trusted as-is (see
+	// loadmodel.CircuitModel.bucketConfidence).
 	ConfidenceThreshold float64 `toml:"confidence_threshold"`
 	// MinChargeKW: a grid-charge permit must yield at least this much charge,
 	// killing the "enter bypass, charge nothing" degeneracy.
@@ -240,6 +244,31 @@ type Optimizer struct {
 	// BlipCost: objective penalty (currency) per bypass entry, so marginal-gain
 	// windows are skipped rather than incurring a load-transfer blip.
 	BlipCost float64 `toml:"blip_cost"`
+}
+
+// LoadModel tunes the load model's recency/headroom estimation (see
+// loadmodel.Model). It replaces a flat arithmetic mean over the whole
+// training window — which dilutes a recent step-change in household load —
+// with a recency-weighted LEVEL times a percentile-headroom SHAPE.
+type LoadModel struct {
+	// LookbackDays is how far back Train() reads samples from the time-series
+	// store; also the window the per-bucket SHAPE/percentile is computed over.
+	// Default 30.
+	LookbackDays float64 `toml:"lookback_days"`
+	// RecencyHalfLifeDays exponentially decays a training sample's weight by
+	// age when computing the model's LEVEL (the current baseline power), so a
+	// step change (new appliance, occupancy change, seasonal transition) is
+	// tracked within days instead of being diluted across the full lookback.
+	// Default 3.
+	RecencyHalfLifeDays float64 `toml:"recency_half_life_days"`
+	// Percentile (0-1) is used instead of the mean for each bucket's
+	// hour-of-day/season SHAPE, so peaky buckets (e.g. a kettle + induction
+	// hob at breakfast) bias predictions up rather than being averaged away.
+	// Default 0.75 (p75).
+	Percentile float64 `toml:"percentile"`
+	// ConservativeMargin multiplies a bucket's prediction when its confidence
+	// is below Optimizer.ConfidenceThreshold. Default 1.3 (+30%).
+	ConservativeMargin float64 `toml:"conservative_margin"`
 }
 
 // PVModel configures the persistent PV-response learning model: the far-horizon
@@ -475,6 +504,22 @@ func (c *Config) finalize() error {
 	}
 	if c.Optimizer.BlipCost == 0 {
 		c.Optimizer.BlipCost = 5.0
+	}
+	if c.Optimizer.ConfidenceThreshold == 0 {
+		c.Optimizer.ConfidenceThreshold = 0.3
+	}
+
+	if c.LoadModel.LookbackDays == 0 {
+		c.LoadModel.LookbackDays = 30
+	}
+	if c.LoadModel.RecencyHalfLifeDays == 0 {
+		c.LoadModel.RecencyHalfLifeDays = 3
+	}
+	if c.LoadModel.Percentile == 0 {
+		c.LoadModel.Percentile = 0.75
+	}
+	if c.LoadModel.ConservativeMargin == 0 {
+		c.LoadModel.ConservativeMargin = 1.3
 	}
 
 	if c.PVModel.DataDir == "" {
