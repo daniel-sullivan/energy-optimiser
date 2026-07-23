@@ -21,11 +21,6 @@ import (
 // entity for negligible changes).
 const adjustEpsilon = 0.5
 
-// minPlausibleVoltageV rejects an implausibly low fresh pack-voltage reading
-// (e.g. a glitched sensor) that would otherwise inflate the kW→A conversion
-// toward the current ceiling. Below this, kW→A falls back to nominal voltage.
-const minPlausibleVoltageV = 40.0
-
 // HA service plumbing. The actuator commands the SRNE inverter through three
 // standard HA entity types: a switch (timed-charge enable), a number (per-unit
 // charge current), and text entities (the "HH:MM" charge-window bounds).
@@ -108,11 +103,10 @@ type chargeState struct {
 // a programmed off-peak window) and an out-of-band HA dead-man automation that
 // disables timed charge if the daemon's MQTT availability goes offline.
 type Actuator struct {
-	cfg     config.ActuatorHW
-	battery config.Battery
-	rates   *config.Rates
-	ha      haClient
-	mode    Mode
+	cfg   config.ActuatorHW
+	rates *config.Rates
+	ha    haClient
+	mode  Mode
 
 	cmds   chan command
 	closed chan struct{}
@@ -155,7 +149,7 @@ type command struct {
 
 // New constructs the actuator. It performs no I/O and starts no goroutines;
 // call Start (after HA is connected) to reconcile and begin control.
-func New(cfg config.ActuatorHW, battery config.Battery, rates *config.Rates, ha haClient, mode Mode) (*Actuator, error) {
+func New(cfg config.ActuatorHW, rates *config.Rates, ha haClient, mode Mode) (*Actuator, error) {
 	if rates == nil {
 		return nil, errors.New("actuator: nil rates")
 	}
@@ -163,14 +157,13 @@ func New(cfg config.ActuatorHW, battery config.Battery, rates *config.Rates, ha 
 		return nil, errors.New("actuator: nil ha client")
 	}
 	a := &Actuator{
-		cfg:     cfg,
-		battery: battery,
-		rates:   rates,
-		ha:      ha,
-		mode:    mode,
-		cmds:    make(chan command, 8),
-		closed:  make(chan struct{}),
-		now:     time.Now,
+		cfg:    cfg,
+		rates:  rates,
+		ha:     ha,
+		mode:   mode,
+		cmds:   make(chan command, 8),
+		closed: make(chan struct{}),
+		now:    time.Now,
 
 		confirmTimeout: cfg.ReadBackTimeout.Duration,
 		spacing:        writeSpacing,
@@ -825,10 +818,15 @@ func (a *Actuator) pause() {
 // kwToAmps converts a grid-share kW target to a per-unit charge current. The
 // commanded gridKW is first clamped to the AGGREGATE pack ceiling (MaxChargeKW)
 // so a high per-unit amp headroom can never exceed pack acceptance; the per-unit
-// MaxChargeCurrentA then bounds the result a second time. Uses the live pack
-// voltage when fresh AND plausible, nominal otherwise. mains_charge_current is
-// per-inverter, so the two parallel units double the delivered current — the
-// division by NumUnits is what makes the confirmed-live 6 kW draw correct.
+// MaxChargeCurrentA then bounds the result a second time.
+//
+// mains_charge_current is an AC-side limit on each inverter's grid draw, so the
+// conversion divides by the AC line voltage (ACChargeVoltageV, ~103 V), NOT the
+// DC pack voltage. Using pack voltage (52.8 V) here understated the divisor ~2×
+// and doubled the commanded amps → ~2× grid over-draw. Confirmed live: 30 A/unit
+// drew ~6.0 kW over ~56 A mains ⇒ ~103 V/leg. The two parallel units each honour
+// the per-unit limit, so pack current is NumUnits × per-unit amps — hence the
+// division by NumUnits.
 func (a *Actuator) kwToAmps(gridKW float64) float64 {
 	if gridKW <= 0 {
 		return 0
@@ -836,18 +834,14 @@ func (a *Actuator) kwToAmps(gridKW float64) float64 {
 	if a.cfg.MaxChargeKW > 0 && gridKW > a.cfg.MaxChargeKW {
 		gridKW = a.cfg.MaxChargeKW
 	}
-	v := a.battery.NominalVoltageV
-	if a.ha.Fresh(a.cfg.BatteryVoltageSensor, a.cfg.VoltageStale.Duration) {
-		if live := a.ha.StateFloat(a.cfg.BatteryVoltageSensor); live >= minPlausibleVoltageV {
-			v = live
-		}
-	}
+	v := a.cfg.ACChargeVoltageV
 	if v <= 0 {
-		v = 52.8 // ultimate fallback (16S LiFePO4 operating median)
+		v = 103.0 // ultimate fallback (measured split-phase leg voltage)
 	}
 	n := a.cfg.NumUnits
 	if n <= 0 {
-		n = 1
+		n = 2 // match finalizeActuator's default; a smaller n would halve the
+		// divisor and DOUBLE per-unit amps — err toward the safe (larger) divisor.
 	}
 	amps := gridKW * 1000.0 / (v * float64(n))
 	if amps < 0 {

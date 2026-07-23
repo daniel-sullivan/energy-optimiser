@@ -86,6 +86,7 @@ soc_risk_weight = 2.0
 confidence_threshold = 0.3  # below this, use conservative defaults
 min_charge_kw = 1.0         # a grid-charge permit must yield >= this (no empty-bypass)
 blip_cost = 5.0             # currency penalty per bypass entry (skips marginal windows)
+max_grid_import_kw = 10.0   # per-slot grid-import cap (kW), soft/penalised — the electrical service limit
 
 # [load_model]
 # lookback_days = 30            # training window; also the SHAPE/percentile window
@@ -117,15 +118,14 @@ device_id = "srne_system"                 # actuation target: your inverter's MQ
 [actuator]
 # timed_charge_switch = "switch.srne_solar_system_timed_charge_grid"
 # mains_charge_current_number = "number.srne_solar_system_mains_charge_current"
-# battery_voltage_sensor = "sensor.srne_solar_system_battery_voltage"
 # num_units = 2                   # parallel inverter units the per-unit current applies to
-# max_charge_current_a = 100      # per-unit current clamp (A)
+# max_charge_current_a = 50       # per-unit current clamp (A); 2 × 50 A × 103 V ≈ 10 kW ≈ 50 A/phase (service backstop)
+# ac_charge_voltage_v = 103       # AC line voltage (per split-phase leg) for the kW→A conversion — NOT the DC pack voltage
 # window_inset = "5m"             # shrink each mirrored charge window this much at both ends (clock-skew guard vs peak)
 # state_dir = "/data"             # persists the (informational) charge intent across restart (default: pv_model.data_dir)
 # watchdog_interval = "30s"       # cadence of the never-charging-outside-off-peak safety check + window-rail re-assert
 # write_timeout = "10s"           # per inverter write + ack
 # read_back_timeout = "45s"       # bound on the read-back that confirms a write landed (SRNE echo ~20-40s); too short churns retries
-# voltage_stale = "5m"            # battery-voltage reading older than this → nominal-voltage fallback
 # state_stale = "5m"              # timed-charge switch reading older than this → watchdog disables it outside a window
 #
 # The inverter's 3 timed-charge window slots ("HH:MM" text entities). The actuator

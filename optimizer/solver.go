@@ -28,6 +28,16 @@ const (
 	penWeightHigh = 10.0
 )
 
+// overImportWeight prices a kWh of grid import ABOVE MaxGridImportKW, relative to
+// the peak rate. It is deliberately enormous (≫ any tariff or SOC term) so the
+// optimiser never plans to exceed the cap for arbitrage or battery-charging — the
+// slack is driven to zero whenever any within-cap solution exists. It is a soft
+// bound, not a hard one: when real load alone forces import over the cap the model
+// stays FEASIBLE (paying the penalty) rather than failing, so a plan is still
+// produced and the actuator/alerting path still runs. See the grid-import cap
+// discussion in DESIGN.md.
+const overImportWeight = 1000.0
+
 // Solve builds the MILP problem and returns the optimal schedule.
 //
 // The model is pure Go (go-milp): no cgo, no process-global solver state, and
@@ -71,6 +81,9 @@ func Solve(in *Input) (*Schedule, error) {
 	penLow := make([]milp.Var, T)
 	penMed := make([]milp.Var, T)
 	penHigh := make([]milp.Var, T)
+	// over[t] is the amount by which grid import exceeds MaxGridImportKW in slot t
+	// (a penalised soft-cap slack). Only allocated when a cap is configured.
+	over := make([]milp.Var, T)
 	// soc has T+1 entries: soc[0] is the (clamped) current SOC, soc[t+1] is the
 	// SOC at the end of slot t.
 	soc := make([]milp.Var, T+1)
@@ -92,12 +105,17 @@ func Solve(in *Input) (*Schedule, error) {
 		}
 		charge[t] = m.AddContinuous(0, in.Battery.MaxChargeKW)
 		discharge[t] = m.AddContinuous(0, in.Battery.MaxDischargeKW)
+		// Grid import is never hard-bounded: the cap is enforced softly via over[t]
+		// (below) so real load can never make the balance constraint infeasible.
 		gridImport[t] = m.AddContinuous(0, milp.Inf)
 		gridExport[t] = m.AddContinuous(0, milp.Inf)
 		start[t] = m.AddContinuous(0, 1)
 		penLow[t] = m.AddContinuous(0, milp.Inf)
 		penMed[t] = m.AddContinuous(0, milp.Inf)
 		penHigh[t] = m.AddContinuous(0, milp.Inf)
+		if in.MaxGridImportKW > 0 {
+			over[t] = m.AddContinuous(0, milp.Inf)
+		}
 	}
 
 	// ---------- Objective ----------
@@ -124,6 +142,12 @@ func Solve(in *Input) (*Schedule, error) {
 			milp.Term{Var: penMed[t], Coef: in.SOCRiskWeight * penWeightMed * penScale * penScaleH},
 			milp.Term{Var: penHigh[t], Coef: in.SOCRiskWeight * penWeightHigh * penScale * penScaleH},
 		)
+		if in.MaxGridImportKW > 0 {
+			// Over-cap import priced far above any tariff/SOC term (energy-weighted
+			// like the tariff terms) so it is only ever nonzero when load leaves no
+			// feasible within-cap solution.
+			obj = append(obj, milp.Term{Var: over[t], Coef: overImportWeight * penScale * h[t]})
+		}
 	}
 	m.SetObjective(milp.Minimize, obj)
 
@@ -136,6 +160,16 @@ func Solve(in *Input) (*Schedule, error) {
 			{Var: charge[t], Coef: -1},
 			{Var: gridExport[t], Coef: -1},
 		}, milp.EqualTo, in.LoadKW[t]-in.SolarKW[t])
+
+		// 1a. Soft grid-import cap: over[t] ≥ grid_import[t] - MaxGridImportKW.
+		//     over[t] ≥ 0 (its lower bound), so it is 0 while import ≤ cap and picks
+		//     up the excess otherwise, priced by overImportWeight in the objective.
+		if in.MaxGridImportKW > 0 {
+			m.AddConstraint([]milp.Term{
+				{Var: over[t], Coef: 1},
+				{Var: gridImport[t], Coef: -1},
+			}, milp.GreaterEq, -in.MaxGridImportKW)
+		}
 
 		// 2. SOC tracking: soc[t+1] - soc[t] - (η_c·charge - discharge/η_d)·Δh/cap = 0
 		m.AddConstraint([]milp.Term{

@@ -183,7 +183,7 @@ func TestPeakSlotsNeverGridCharge(t *testing.T) {
 	in := &Input{
 		Now: time.Date(2024, 1, 15, 14, 0, 0, 0, time.UTC), NumSlots: T, SlotMinutes: 30,
 		SolarKW: solar, LoadKW: load, Rates: rates, IsOffPeak: off, CurrentSOC: 0.25,
-		Battery: config.Battery{CapacityKWh: 9.6, MaxChargeKW: 5, MaxDischargeKW: 5, SOCMin: 0.20, SOCMax: 1.0, Efficiency: 0.95},
+		Battery:  config.Battery{CapacityKWh: 9.6, MaxChargeKW: 5, MaxDischargeKW: 5, SOCMin: 0.20, SOCMax: 1.0, Efficiency: 0.95},
 		PeakRate: 40.0, SOCRiskWeight: 2.0, MinChargeKW: 1.0, BlipCost: 5.0,
 	}
 	fillUniform(in)
@@ -296,4 +296,223 @@ func TestPrepareInput(t *testing.T) {
 	if !input.IsOffPeak[3] {
 		t.Error("slot 3 (3:30 AM) should be off-peak")
 	}
+}
+
+// TestGridImportCapEnforced verifies MaxGridImportKW is a hard per-slot bound.
+// The scenario is deliberately built so the *unbounded* optimum wants to draw
+// well above the cap in at least one slot (charge the battery hard in the short
+// cheap off-peak window to cover a long expensive peak), then re-solves the same
+// problem with a low cap and asserts no slot exceeds it.
+func TestGridImportCapEnforced(t *testing.T) {
+	now := time.Date(2024, 1, 15, 3, 0, 0, 0, time.UTC) // 3 AM, off-peak
+
+	build := func(cap float64) *Input {
+		in := &Input{
+			Now:         now,
+			NumSlots:    6,
+			SlotMinutes: 30,
+			SolarKW:     []float64{0, 0, 0, 0, 0, 0},
+			LoadKW:      []float64{1, 1, 5, 5, 5, 5},
+			Rates:       []float64{0.10, 0.10, 0.40, 0.40, 0.40, 0.40},
+			IsOffPeak:   []bool{true, true, false, false, false, false},
+			CurrentSOC:  0.40,
+			Battery: config.Battery{
+				CapacityKWh:    20.0,
+				MaxChargeKW:    5.0,
+				MaxDischargeKW: 8.0,
+				SOCMin:         0.10,
+				SOCMax:         1.0,
+				Efficiency:     0.95,
+			},
+			FeedInRate:      0.05,
+			PeakRate:        0.40,
+			SOCRiskWeight:   2.0,
+			MinChargeKW:     1.0,
+			BlipCost:        5.0,
+			MaxGridImportKW: cap,
+		}
+		fillUniform(in)
+		return in
+	}
+
+	const capKW = 3.0
+	const tol = 1e-6
+
+	// Unbounded (cap = 0 = no limit): confirm the scenario genuinely wants to
+	// draw above capKW somewhere, otherwise the cap test below is vacuous.
+	unbounded, err := Solve(build(0))
+	if err != nil {
+		t.Fatalf("unbounded solve: %v", err)
+	}
+	var maxUnbounded float64
+	for _, s := range unbounded.Slots {
+		if s.GridImportKW > maxUnbounded {
+			maxUnbounded = s.GridImportKW
+		}
+	}
+	if maxUnbounded <= capKW {
+		t.Fatalf("scenario is vacuous: unbounded peak import %.3f kW <= cap %.1f kW; "+
+			"cap would never bind", maxUnbounded, capKW)
+	}
+
+	// Capped: no slot may exceed the cap.
+	capped, err := Solve(build(capKW))
+	if err != nil {
+		t.Fatalf("capped solve: %v", err)
+	}
+	for i, s := range capped.Slots {
+		if s.GridImportKW > capKW+tol {
+			t.Errorf("slot %d: grid import %.4f kW exceeds cap %.1f kW", i, s.GridImportKW, capKW)
+		}
+	}
+	t.Logf("unbounded peak import %.2f kW -> capped peak import respects %.1f kW", maxUnbounded, capKW)
+}
+
+// TestGridImportCapSpreadsDeepDeficit verifies that when the required off-peak
+// charge energy exceeds what a single capped slot can deliver, the solver
+// spreads charging across multiple slots instead of spiking one — the whole
+// point of the cap. Peak load (5 kW) exceeds the 3 kW import cap, so the battery
+// MUST supply the difference during peak; covering it needs more stored energy
+// than one off-peak slot at the cap can add, forcing multi-slot charging.
+func TestGridImportCapSpreadsDeepDeficit(t *testing.T) {
+	now := time.Date(2024, 1, 15, 1, 0, 0, 0, time.UTC) // 1 AM, off-peak
+
+	const T = 10
+	solar := make([]float64, T)
+	load := make([]float64, T)
+	rates := make([]float64, T)
+	off := make([]bool, T)
+	for i := range T {
+		if i < 6 { // slots 0-5 off-peak
+			load[i] = 1
+			rates[i] = 0.10
+			off[i] = true
+		} else { // slots 6-9 deep peak
+			load[i] = 5
+			rates[i] = 0.40
+			off[i] = false
+		}
+	}
+
+	const capKW = 3.0
+	const tol = 1e-6
+
+	in := &Input{
+		Now:         now,
+		NumSlots:    T,
+		SlotMinutes: 30,
+		SolarKW:     solar,
+		LoadKW:      load,
+		Rates:       rates,
+		IsOffPeak:   off,
+		CurrentSOC:  0.20,
+		Battery: config.Battery{
+			CapacityKWh:    20.0,
+			MaxChargeKW:    5.0,
+			MaxDischargeKW: 5.0,
+			SOCMin:         0.10,
+			SOCMax:         1.0,
+			Efficiency:     0.95,
+		},
+		FeedInRate:      0.0,
+		PeakRate:        0.40,
+		SOCRiskWeight:   2.0,
+		MinChargeKW:     1.0,
+		BlipCost:        5.0,
+		MaxGridImportKW: capKW,
+	}
+	fillUniform(in)
+
+	sched, err := Solve(in)
+	if err != nil {
+		t.Fatalf("solve: %v", err)
+	}
+
+	// Invariant: no slot exceeds the cap.
+	for i, s := range sched.Slots {
+		if s.GridImportKW > capKW+tol {
+			t.Errorf("slot %d: grid import %.4f kW exceeds cap %.1f kW", i, s.GridImportKW, capKW)
+		}
+	}
+
+	// Spread: charging must occur in at least two distinct off-peak slots, since
+	// no single capped slot can add enough energy to cover the peak deficit.
+	chargingSlots := 0
+	var offPeakImportKWh float64
+	for i := range 6 {
+		s := sched.Slots[i]
+		offPeakImportKWh += s.GridImportKW * in.SlotHours[i]
+		if s.GridCharge && s.BatteryFlowKW > 0.1 {
+			chargingSlots++
+		}
+	}
+	if chargingSlots < 2 {
+		t.Errorf("expected charging spread across >=2 off-peak slots, got %d", chargingSlots)
+	}
+	// One slot at the cap over 30 min delivers at most capKW*0.5 kWh of import;
+	// exceeding that proves the import was necessarily spread.
+	if offPeakImportKWh <= capKW*0.5+tol {
+		t.Errorf("off-peak import %.3f kWh fits in a single capped slot; expected spread", offPeakImportKWh)
+	}
+	t.Logf("charging spread across %d off-peak slots, %.2f kWh off-peak import", chargingSlots, offPeakImportKWh)
+}
+
+// TestGridImportCapStaysFeasibleWhenLoadForcesOverImport is the degradation test
+// for the soft cap: when real load alone exceeds MaxGridImportKW and the battery
+// is floored (so it cannot supply the difference), the solve must NOT go
+// infeasible. It must return a valid plan whose import reflects the forced
+// over-draw. A hard cap would fail here and make hub.tick early-return (serving a
+// stale plan and never re-commanding the actuator or alerting).
+func TestGridImportCapStaysFeasibleWhenLoadForcesOverImport(t *testing.T) {
+	now := time.Date(2024, 1, 15, 18, 0, 0, 0, time.UTC) // 6 PM, peak
+
+	const T = 4
+	const capKW = 10.0
+	const socMin = 0.20
+
+	in := &Input{
+		Now:         now,
+		NumSlots:    T,
+		SlotMinutes: 30,
+		SolarKW:     []float64{0, 0, 0, 0},
+		LoadKW:      []float64{15, 3, 3, 3}, // slot 0 load exceeds the cap
+		Rates:       []float64{0.40, 0.40, 0.40, 0.40},
+		IsOffPeak:   []bool{false, false, false, false},
+		CurrentSOC:  socMin, // floored: battery cannot discharge to cover the spike
+		Battery: config.Battery{
+			CapacityKWh:    10.0,
+			MaxChargeKW:    5.0,
+			MaxDischargeKW: 5.0,
+			SOCMin:         socMin,
+			SOCMax:         1.0,
+			Efficiency:     0.95,
+		},
+		FeedInRate:      0.0,
+		PeakRate:        0.40,
+		SOCRiskWeight:   2.0,
+		MinChargeKW:     1.0,
+		BlipCost:        5.0,
+		MaxGridImportKW: capKW,
+	}
+	fillUniform(in)
+
+	sched, err := Solve(in)
+	if err != nil {
+		t.Fatalf("soft cap must keep the solve feasible when load forces over-import, got: %v", err)
+	}
+	// The forced slot must carry the real load as import (~15 kW), above the cap —
+	// proving the model acknowledged reality rather than failing.
+	if got := sched.Slots[0].GridImportKW; got < in.LoadKW[0]-1e-3 {
+		t.Errorf("slot 0: grid import %.3f kW, want >= load %.1f kW (forced over-import)", got, in.LoadKW[0])
+	}
+	if sched.Slots[0].GridImportKW <= capKW {
+		t.Errorf("slot 0: grid import %.3f kW should exceed the cap %.1f kW under forced load", sched.Slots[0].GridImportKW, capKW)
+	}
+	// Non-forced slots (load 3 kW < cap) must still respect the cap.
+	for i := 1; i < T; i++ {
+		if sched.Slots[i].GridImportKW > capKW+1e-6 {
+			t.Errorf("slot %d: grid import %.3f kW exceeds cap %.1f kW despite load within cap", i, sched.Slots[i].GridImportKW, capKW)
+		}
+	}
+	t.Logf("forced slot import %.2f kW (cap %.1f) — feasible, over-cap acknowledged", sched.Slots[0].GridImportKW, capKW)
 }

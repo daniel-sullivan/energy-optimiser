@@ -118,13 +118,12 @@ type Weather struct {
 }
 
 type Battery struct {
-	CapacityKWh     float64 `toml:"capacity_kwh"`
-	MaxChargeKW     float64 `toml:"max_charge_kw"`
-	MaxDischargeKW  float64 `toml:"max_discharge_kw"`
-	SOCMin          float64 `toml:"soc_min"`
-	SOCMax          float64 `toml:"soc_max"`
-	Efficiency      float64 `toml:"efficiency"`
-	NominalVoltageV float64 `toml:"nominal_voltage_v"` // for kW→A actuation (Phase 1)
+	CapacityKWh    float64 `toml:"capacity_kwh"`
+	MaxChargeKW    float64 `toml:"max_charge_kw"`
+	MaxDischargeKW float64 `toml:"max_discharge_kw"`
+	SOCMin         float64 `toml:"soc_min"`
+	SOCMax         float64 `toml:"soc_max"`
+	Efficiency     float64 `toml:"efficiency"`
 }
 
 type Rates struct {
@@ -244,6 +243,31 @@ type Optimizer struct {
 	// BlipCost: objective penalty (currency) per bypass entry, so marginal-gain
 	// windows are skipped rather than incurring a load-transfer blip.
 	BlipCost float64 `toml:"blip_cost"`
+	// MaxGridImportKW is the hard electrical-connection limit on grid import
+	// (kW) per slot — derived from the contracted service capacity, not a
+	// tuning knob (the inverter's own MAX LINE setting is a separate,
+	// independently-configured guard, and may be set more conservatively than
+	// the service itself). Grid import is house load plus any grid-charge power
+	// combined (the battery can't discharge to the house while a grid-charge
+	// permit is active), so this bounds total draw during a bypass slot, not
+	// just the charge rate. Unlike PVModel.MaxPVKW (0 = unbounded, opt-in
+	// ceiling), 0/unset here resolves to a safe non-zero default in finalize —
+	// leaving it unconfigured is exactly the failure mode this field exists to
+	// prevent.
+	//
+	// Default: a 12 kVA single-phase-3-wire (単相3線) service ≈ 60 A/phase at
+	// 100V; 10.0 kW ≈ 50 A/phase balanced across the two lines, leaving ~10
+	// A/phase margin under the 60 A service. This assumes grid draw is roughly
+	// balanced across L1/L2 (the two inverter units sit on the two phases) —
+	// the solver only models a single aggregate grid-import kW, so a total-kW
+	// cap maps to a per-phase current cap only under that balance assumption.
+	// It is necessary but not sufficient: a badly imbalanced split (e.g. one
+	// unit drawing far more than the other) could still push one phase over 60
+	// A while the aggregate stays under 10 kW. A true per-phase guard would be
+	// more precise; this total-kW cap plus ActuatorHW.MaxChargeCurrentA (a
+	// per-unit amp clamp, independent of this aggregate) are the two guards
+	// until one exists.
+	MaxGridImportKW float64 `toml:"max_grid_import_kw"`
 }
 
 // LoadModel tunes the load model's recency/headroom estimation (see
@@ -346,9 +370,6 @@ type ActuatorHW struct {
 	// MainsChargeCurrentNumber is the per-unit grid-charge current (A) number
 	// entity. It is adjustable live while timed charge is enabled.
 	MainsChargeCurrentNumber string `toml:"mains_charge_current_number"`
-	// BatteryVoltageSensor is the live pack-voltage sensor used for kW→A; falls
-	// back to Battery.NominalVoltageV when stale/unavailable.
-	BatteryVoltageSensor string `toml:"battery_voltage_sensor"`
 
 	// ChargeWindows are the inverter's timed-charge window slots (start/end "HH:MM"
 	// text entities). They are a STATIC HARDWARE RAIL: grid charging can only occur
@@ -370,8 +391,17 @@ type ActuatorHW struct {
 	// NumUnits is the count of parallel inverter units the per-unit current is
 	// applied to (the pack current is NumUnits × per-unit amps).
 	NumUnits int `toml:"num_units"`
-	// MaxChargeCurrentA clamps the commanded per-unit current (A).
+	// MaxChargeCurrentA clamps the commanded per-unit current (A). Sized as the
+	// per-unit share of the electrical service ceiling: at ACChargeVoltageV·NumUnits
+	// it back-stops the optimizer's MaxGridImportKW cap (50 A/unit × 2 × 103 V ≈
+	// 10 kW ≈ 50 A/phase), so a solver fault can never command beyond the cap.
 	MaxChargeCurrentA float64 `toml:"max_charge_current_a"`
+	// ACChargeVoltageV is the AC line voltage (per split-phase leg, ~103 V) used to
+	// convert a grid-charge kW target to per-unit mains_charge_current amps. The
+	// mains_charge_current register is an AC-side draw limit, so the DC pack voltage
+	// must NOT be used here (doing so understated the divisor ~2× and doubled the
+	// commanded amps). Defaults to 103 (measured 単相3線 leg voltage).
+	ACChargeVoltageV float64 `toml:"ac_charge_voltage_v"`
 	// MaxChargeKW is the AGGREGATE grid-charge ceiling (kW) applied to the whole
 	// pack BEFORE the kW→A conversion, so a high per-unit amp headroom can never
 	// command more than the pack can accept. Defaults to Battery.MaxChargeKW (or
@@ -397,11 +427,9 @@ type ActuatorHW struct {
 	// spurious retries.
 	ReadBackTimeout Duration `toml:"read_back_timeout"`
 
-	// VoltageStale marks the battery-voltage reading stale (→ nominal fallback)
-	// past this age; StateStale marks the timed-charge switch reading stale (→
-	// watchdog disables it outside a window) past this age.
-	VoltageStale Duration `toml:"voltage_stale"`
-	StateStale   Duration `toml:"state_stale"`
+	// StateStale marks the timed-charge switch reading stale (→ watchdog disables
+	// it outside a window) past this age.
+	StateStale Duration `toml:"state_stale"`
 }
 
 type Circuit struct {
@@ -507,6 +535,9 @@ func (c *Config) finalize() error {
 	}
 	if c.Optimizer.ConfidenceThreshold == 0 {
 		c.Optimizer.ConfidenceThreshold = 0.3
+	}
+	if c.Optimizer.MaxGridImportKW == 0 {
+		c.Optimizer.MaxGridImportKW = 10.0
 	}
 
 	if c.LoadModel.LookbackDays == 0 {
@@ -640,9 +671,6 @@ func (c *Config) finalizeActuator() {
 	if a.MainsChargeCurrentNumber == "" {
 		a.MainsChargeCurrentNumber = "number.srne_solar_system_mains_charge_current"
 	}
-	if a.BatteryVoltageSensor == "" {
-		a.BatteryVoltageSensor = "sensor.srne_solar_system_battery_voltage"
-	}
 	if len(a.ChargeWindows) == 0 {
 		a.ChargeWindows = []ChargeWindowEntities{
 			{Start: "text.srne_solar_system_charge_window_1_start", End: "text.srne_solar_system_charge_window_1_end"},
@@ -654,7 +682,10 @@ func (c *Config) finalizeActuator() {
 		a.NumUnits = 2
 	}
 	if a.MaxChargeCurrentA == 0 {
-		a.MaxChargeCurrentA = 100
+		a.MaxChargeCurrentA = 50 // per-unit share of the 12 kVA service (2 × 50 A × 103 V ≈ 10 kW)
+	}
+	if a.ACChargeVoltageV == 0 {
+		a.ACChargeVoltageV = 103 // measured 単相3線 leg voltage
 	}
 	if a.MaxChargeKW == 0 {
 		a.MaxChargeKW = c.Battery.MaxChargeKW
@@ -678,9 +709,6 @@ func (c *Config) finalizeActuator() {
 		// SRNE echo/apply lag is ~20-40s for these entities; 45s gives margin so a
 		// legitimate write confirms on its first landing rather than churning retries.
 		a.ReadBackTimeout.Duration = 45 * time.Second
-	}
-	if a.VoltageStale.Duration == 0 {
-		a.VoltageStale.Duration = 5 * time.Minute
 	}
 	if a.StateStale.Duration == 0 {
 		a.StateStale.Duration = 5 * time.Minute

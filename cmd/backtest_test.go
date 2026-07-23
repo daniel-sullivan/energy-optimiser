@@ -25,7 +25,6 @@ max_discharge_kw = 5
 soc_min = 0.1
 soc_max = 0.9
 efficiency = 0.9
-nominal_voltage_v = 52
 [rates]
 currency = "JPY"
 peak_rate = 30

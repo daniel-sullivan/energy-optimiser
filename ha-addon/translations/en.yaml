@@ -99,9 +99,6 @@ configuration:
   battery.efficiency:
     name: Round-Trip Efficiency
     description: Battery round-trip efficiency (0.0-1.0).
-  battery.nominal_voltage_v:
-    name: Nominal Voltage (V)
-    description: Optional nominal pack voltage, used for kW-to-amps actuation.
   rates:
     name: Electricity Rates
     description: Tariff structure used to price the optimisation.
@@ -139,6 +136,23 @@ configuration:
   optimizer.blip_cost:
     name: Blip Cost
     description: Objective penalty (in currency) per bypass/mode-switch entry.
+  optimizer.max_grid_import_kw:
+    name: Max Grid Import (kW)
+    description: >-
+      Per-slot cap on grid import (kW) — your electrical service limit. The
+      optimiser is heavily penalised for planning to draw above this, so it
+      never charges beyond the cap; if real load alone exceeds it the plan stays
+      valid rather than failing.
+  actuator.max_charge_current_a:
+    name: Max Charge Current (A/unit)
+    description: >-
+      Per-inverter clamp on the commanded grid-charge current. Back-stops the
+      grid-import cap in hardware (per-unit share of the service ceiling).
+  actuator.ac_charge_voltage_v:
+    name: AC Charge Voltage (V)
+    description: >-
+      AC line voltage (per split-phase leg, ~103 V) used to convert a kW charge
+      target to per-unit amps. This is the AC-side voltage, NOT the DC pack voltage.
   mqtt:
     name: MQTT
     description: >-

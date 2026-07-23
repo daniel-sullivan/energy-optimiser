@@ -1,7 +1,7 @@
 name: Energy Optimiser
 description: Forecast-driven off-peak battery charge optimiser for solar + battery systems
 slug: energy-optimiser
-version: 0.2.6
+version: 0.2.7
 url: https://github.com/daniel-sullivan/energy-optimiser
 arch:
   - amd64
@@ -59,7 +59,6 @@ options:
     soc_min: 0.2
     soc_max: 1.0
     efficiency: 0.95
-    nominal_voltage_v: 51.2
   rates:
     currency: "USD"
     peak_rate: 0.35
@@ -74,6 +73,10 @@ options:
     confidence_threshold: 0.3
     min_charge_kw: 1.0
     blip_cost: 5.0
+    max_grid_import_kw: 10.0
+  actuator:
+    max_charge_current_a: 50
+    ac_charge_voltage_v: 103
   pv_model:
     max_pv_kw: 25
   mqtt:
@@ -128,7 +131,6 @@ schema:
     soc_min: "float(0,1)"
     soc_max: "float(0,1)"
     efficiency: "float(0,1)"
-    nominal_voltage_v: float?
   rates:
     currency: str
     peak_rate: float
@@ -143,6 +145,10 @@ schema:
     confidence_threshold: "float(0,1)"
     min_charge_kw: float
     blip_cost: float
+    max_grid_import_kw: float
+  actuator:
+    max_charge_current_a: float
+    ac_charge_voltage_v: float
   pv_model:
     max_pv_kw: "float(0,1000)?"
   mqtt:

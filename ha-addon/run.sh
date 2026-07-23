@@ -119,7 +119,6 @@ MAX_DISCHARGE_KW=$(bashio::config 'battery.max_discharge_kw')
 SOC_MIN=$(bashio::config 'battery.soc_min')
 SOC_MAX=$(bashio::config 'battery.soc_max')
 EFFICIENCY=$(bashio::config 'battery.efficiency')
-NOMINAL_VOLTAGE_V=$(bashio::config 'battery.nominal_voltage_v')
 
 cat >> "${CONFIG}" <<EOF
 
@@ -131,9 +130,6 @@ soc_min = ${SOC_MIN}
 soc_max = ${SOC_MAX}
 efficiency = ${EFFICIENCY}
 EOF
-if [ -n "${NOMINAL_VOLTAGE_V}" ] && [ "${NOMINAL_VOLTAGE_V}" != "null" ]; then
-    echo "nominal_voltage_v = ${NOMINAL_VOLTAGE_V}" >> "${CONFIG}"
-fi
 
 # --- Electricity rates / tariff windows ---
 CURRENCY=$(bashio::config 'rates.currency')
@@ -169,6 +165,7 @@ SOC_RISK_WEIGHT=$(bashio::config 'optimizer.soc_risk_weight')
 CONFIDENCE_THRESHOLD=$(bashio::config 'optimizer.confidence_threshold')
 MIN_CHARGE_KW=$(bashio::config 'optimizer.min_charge_kw')
 BLIP_COST=$(bashio::config 'optimizer.blip_cost')
+MAX_GRID_IMPORT_KW=$(bashio::config 'optimizer.max_grid_import_kw')
 
 cat >> "${CONFIG}" <<EOF
 
@@ -177,6 +174,18 @@ soc_risk_weight = ${SOC_RISK_WEIGHT}
 confidence_threshold = ${CONFIDENCE_THRESHOLD}
 min_charge_kw = ${MIN_CHARGE_KW}
 blip_cost = ${BLIP_COST}
+max_grid_import_kw = ${MAX_GRID_IMPORT_KW}
+EOF
+
+# --- Actuator (grid-charge hardware limits) ---
+MAX_CHARGE_CURRENT_A=$(bashio::config 'actuator.max_charge_current_a')
+AC_CHARGE_VOLTAGE_V=$(bashio::config 'actuator.ac_charge_voltage_v')
+
+cat >> "${CONFIG}" <<EOF
+
+[actuator]
+max_charge_current_a = ${MAX_CHARGE_CURRENT_A}
+ac_charge_voltage_v = ${AC_CHARGE_VOLTAGE_V}
 EOF
 
 # --- PV model (learned far-horizon PV) ---

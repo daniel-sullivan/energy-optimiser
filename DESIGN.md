@@ -115,8 +115,9 @@ bound). One solve per tick, T = `planning_horizon / slot_duration` slots
 | `gridCharge[t]` | binary (off-peak) / fixed 0 (peak) | Permit to draw grid power for charging this slot |
 | `charge[t]` | continuous, `[0, maxChargeKW]` | Battery charge power |
 | `discharge[t]` | continuous, `[0, maxDischargeKW]` | Battery discharge power |
-| `import[t]` | continuous, `≥ 0` | Grid import power |
+| `import[t]` | continuous, `≥ 0` | Grid import power (soft-capped at the electrical service limit via `over[t]`) |
 | `export[t]` | continuous, `≥ 0` | Grid export power |
+| `over[t]` | continuous, `≥ 0` | Grid import above `max_grid_import_kw` (soft-cap slack; allocated only when a cap is set) |
 | `start[t]` | continuous, `[0, 1]` | 1 if this slot begins a new bypass entry (grid-charge turning on) |
 | `soc[t]` | continuous, `[socMin, socMax]` | Battery state of charge at the end of slot t (soc[0] fixed to the current, clamped reading) |
 | `penLow/penMed/penHigh[t]` | continuous, `≥ 0` | SOC-risk penalty slack variables |
@@ -132,6 +133,7 @@ multiplying back to the configured round-trip efficiency.
 − Σ export[t]·feedInRate        export revenue (0 = curtailment)
 + Σ start[t]·blipCost           penalty per bypass entry
 + Σ (penLow[t]·wLow + penMed[t]·wMed + penHigh[t]·wHigh)·socRiskWeight·peakRate
++ Σ over[t]·overImportWeight·peakRate   grid import above the service cap (soft)
 ```
 
 The SOC penalties are scaled into currency via the peak rate so battery
@@ -161,6 +163,23 @@ Peak-tariff slots have `gridCharge` fixed to a constant 0 (a continuous
 variable pinned to `[0,0]`, avoiding an unnecessary binary), so grid-charging
 can only happen inside configured off-peak windows.
 
+**Grid-import cap** — `max_grid_import_kw` (the electrical service limit, default
+10 kW) bounds the *planned* draw in any slot. It is enforced as a **soft**
+constraint: `import[t]` itself is unbounded, but a slack `over[t] ≥ import[t] −
+cap` is priced in the objective at `overImportWeight·peakRate` — enormous relative
+to any tariff or SOC term — so the optimiser drives it to zero whenever any
+within-cap solution exists (a deep off-peak deficit is spread across slots rather
+than pulled in one spike). The softness matters: if real load alone exceeds the
+cap with a depleted battery, a *hard* bound would make the whole MILP infeasible,
+and `hub.tick` would early-return — serving a stale plan, never re-commanding the
+actuator, and firing no alert. The soft cap keeps the model feasible (paying the
+penalty, `over[t] > 0`) so a plan is still produced and the actuation/alert path
+still runs. This is the software half of a two-layer defence: the solver never
+*plans* beyond the cap, and the actuator's per-unit `max_charge_current_a` clamp
+back-stops it in hardware even if a plan (or the kW→A conversion) were wrong.
+Note the cap is a planning bound only — it never physically limits the house's
+grid draw, which is set by real load.
+
 ### Multi-day planning
 
 The 72h rolling horizon lets a poor forecast for tomorrow pull today's
@@ -188,7 +207,14 @@ in place (usually a no-op), set the current, then enable the switch **last**; to
 stop, disable the switch **first**, then zero the current. Consecutive writes are
 spaced and confirmed by read-back (the SRNE drops rapid-fire writes); re-issuing
 is harmless (idempotent, not a power event). The per-unit current is
-`gridKW·1000 / (voltage · numUnits)`, numUnits = 2 parallel inverters.
+`gridKW·1000 / (ac_charge_voltage_v · numUnits)`, numUnits = 2 parallel inverters.
+`mains_charge_current` is an **AC-side** draw limit, so the divisor is the AC line
+voltage (`ac_charge_voltage_v`, ~103 V per split-phase leg) — **not** the DC pack
+voltage; using ~52.8 V there understates the divisor ~2× and doubles the commanded
+amps (confirmed live: 30 A/unit drew ~6 kW over ~56 A mains ⇒ ~103 V/leg). The
+result is clamped to `max_charge_current_a` per unit (default 50 A ⇒ 2 × 50 × 103 V
+≈ 10 kW ≈ 50 A/phase), the per-unit share of the 12 kVA service that back-stops the
+optimiser's grid-import cap in hardware.
 
 Actuation is mode-gated — `observe` (log only), `watchdog` (fail-safe writes
 only), `live` (full control) — resolved once at startup with a config-conflict

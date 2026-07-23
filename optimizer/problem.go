@@ -28,6 +28,13 @@ type Input struct {
 	SOCRiskWeight float64
 	MinChargeKW   float64 // a grid-charge permit must yield >= this
 	BlipCost      float64 // objective penalty per bypass entry (currency)
+	// MaxGridImportKW is the per-slot grid-import cap (kW; the electrical
+	// connection limit). It is enforced as a SOFT bound: import above it is
+	// heavily penalised so the optimiser never plans to exceed it, but real load
+	// that forces import over the cap keeps the model feasible rather than failing.
+	// ≤0 means unbounded (no cap) — used by tests that build Input directly;
+	// PrepareInput always carries config.finalize's safe default.
+	MaxGridImportKW float64
 }
 
 // PrepareInput builds solver input from config, forecasts, and current state.
@@ -64,22 +71,23 @@ func PrepareInput(
 	}
 
 	return &Input{
-		Now:           start,
-		NumSlots:      numSlots,
-		SlotMinutes:   int(cfg.Service.SlotDuration.Minutes()),
-		SlotStart:     grid.Start,
-		SlotHours:     grid.Hours,
-		SolarKW:       solar,
-		LoadKW:        load,
-		Rates:         rates,
-		IsOffPeak:     offPeak,
-		CurrentSOC:    currentSOC,
-		Battery:       cfg.Battery,
-		FeedInRate:    cfg.Rates.FeedInRate,
-		PeakRate:      cfg.Rates.PeakRate,
-		SOCRiskWeight: cfg.Optimizer.SOCRiskWeight,
-		MinChargeKW:   cfg.Optimizer.MinChargeKW,
-		BlipCost:      cfg.Optimizer.BlipCost,
+		Now:             start,
+		NumSlots:        numSlots,
+		SlotMinutes:     int(cfg.Service.SlotDuration.Minutes()),
+		SlotStart:       grid.Start,
+		SlotHours:       grid.Hours,
+		SolarKW:         solar,
+		LoadKW:          load,
+		Rates:           rates,
+		IsOffPeak:       offPeak,
+		CurrentSOC:      currentSOC,
+		Battery:         cfg.Battery,
+		FeedInRate:      cfg.Rates.FeedInRate,
+		PeakRate:        cfg.Rates.PeakRate,
+		SOCRiskWeight:   cfg.Optimizer.SOCRiskWeight,
+		MinChargeKW:     cfg.Optimizer.MinChargeKW,
+		BlipCost:        cfg.Optimizer.BlipCost,
+		MaxGridImportKW: cfg.Optimizer.MaxGridImportKW,
 	}
 }
 

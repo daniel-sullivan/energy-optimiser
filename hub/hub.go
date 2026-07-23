@@ -119,7 +119,7 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 
 	// Actuator — timed-charge grid-charge control. Defaults to observe (no
 	// inverter writes); live actuation requires an explicit mode = "live".
-	act, err := actuator.New(cfg.ActuatorHW, cfg.Battery, &cfg.Rates, h.ha, mode)
+	act, err := actuator.New(cfg.ActuatorHW, &cfg.Rates, h.ha, mode)
 	if err != nil {
 		if h.influx != nil {
 			_ = h.influx.Close()

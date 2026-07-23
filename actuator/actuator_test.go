@@ -223,7 +223,6 @@ func testRates(t *testing.T) *config.Rates {
 const (
 	switchEntity = "switch.timed_charge"
 	ampsEntity   = "number.mains_a"
-	voltEntity   = "sensor.batt_v"
 	w1s          = "text.w1_start"
 	w1e          = "text.w1_end"
 	w2s          = "text.w2_start"
@@ -236,20 +235,19 @@ func testCfg(t *testing.T) config.ActuatorHW {
 	return config.ActuatorHW{
 		TimedChargeSwitch:        switchEntity,
 		MainsChargeCurrentNumber: ampsEntity,
-		BatteryVoltageSensor:     voltEntity,
 		ChargeWindows: []config.ChargeWindowEntities{
 			{Start: w1s, End: w1e},
 			{Start: w2s, End: w2e},
 			{Start: w3s, End: w3e},
 		},
 		NumUnits:          2,
-		MaxChargeCurrentA: 100,
+		MaxChargeCurrentA: 50,
+		ACChargeVoltageV:  103,
 		StateDir:          t.TempDir(),
 		WindowInset:       config.Duration{Duration: 5 * time.Minute},
 		WatchdogInterval:  config.Duration{Duration: time.Hour}, // won't fire mid-test
 		WriteTimeout:      config.Duration{Duration: time.Second},
 		ReadBackTimeout:   config.Duration{Duration: 150 * time.Millisecond},
-		VoltageStale:      config.Duration{Duration: 5 * time.Minute},
 		StateStale:        config.Duration{Duration: 5 * time.Minute},
 	}
 }
@@ -280,7 +278,7 @@ var (
 func startWith(t *testing.T, fake *fakeHA, mode Mode, now time.Time) (*Actuator, *fakeClock) {
 	t.Helper()
 	clock := &fakeClock{t: now}
-	a, err := New(testCfg(t), config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, mode)
+	a, err := New(testCfg(t), testRates(t), fake, mode)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +308,7 @@ func newActuator(t *testing.T, mode Mode, now time.Time, initialSwitch string) (
 // loop-owned methods like ensureWindowsMirrorOffPeak on the test goroutine.
 func rawActuator(t *testing.T, fake *fakeHA, rates *config.Rates, cfg config.ActuatorHW) *Actuator {
 	t.Helper()
-	a, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, rates, fake, ModeLive)
+	a, err := New(cfg, rates, fake, ModeLive)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,26 +695,18 @@ func TestReconcileObserveModeDoesNotWrite(t *testing.T) {
 
 func TestKwToAmps(t *testing.T) {
 	fake := newFakeHA()
-	a, err := New(testCfg(t), config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, ModeLive)
+	a, err := New(testCfg(t), testRates(t), fake, ModeLive)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Fresh live voltage is used (per-unit = kW*1000/(V*numUnits), numUnits=2).
-	fake.setState(voltEntity, "50.0")
-	fake.fresh[voltEntity] = true
-	if got := a.kwToAmps(5.28); !approx(got, 5280/(50.0*2)) {
-		t.Fatalf("live-voltage amps: got %.3f", got)
-	}
-
-	// Stale voltage falls back to nominal (52.8).
-	fake.fresh[voltEntity] = false
-	if got := a.kwToAmps(5.28); !approx(got, 5280/(52.8*2)) {
-		t.Fatalf("nominal-fallback amps: got %.3f", got)
+	// Conversion uses the AC line voltage (per-unit = kW*1000/(V_ac*numUnits),
+	// V_ac=103, numUnits=2), NOT the DC pack voltage.
+	if got := a.kwToAmps(5.15); !approx(got, 5150/(103.0*2)) {
+		t.Fatalf("ac-voltage amps: got %.3f", got)
 	}
 
 	// Clamp to the per-unit ceiling.
-	fake.fresh[voltEntity] = false
 	if got := a.kwToAmps(1000); got != a.cfg.MaxChargeCurrentA {
 		t.Fatalf("clamp: got %.3f want %.1f", got, a.cfg.MaxChargeCurrentA)
 	}
@@ -724,6 +714,17 @@ func TestKwToAmps(t *testing.T) {
 	// Zero/negative → zero.
 	if got := a.kwToAmps(0); got != 0 {
 		t.Fatalf("zero kW must be 0 A, got %.3f", got)
+	}
+
+	// Fallback when ACChargeVoltageV is unset → 103 V.
+	cfg := testCfg(t)
+	cfg.ACChargeVoltageV = 0
+	b, err := New(cfg, testRates(t), fake, ModeLive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := b.kwToAmps(5.15); !approx(got, 5150/(103.0*2)) {
+		t.Fatalf("voltage fallback: got %.3f", got)
 	}
 }
 
@@ -735,32 +736,22 @@ func approx(a, b float64) bool {
 	return d < 1e-6
 }
 
-// TestKwToAmpsAggregateCeilingAndLowVoltage checks the aggregate-kW clamp applies
-// BEFORE the kW→A conversion, and that an implausibly-low fresh voltage falls back
-// to nominal instead of inflating amps.
-func TestKwToAmpsAggregateCeilingAndLowVoltage(t *testing.T) {
+// TestKwToAmpsAggregateCeiling checks the aggregate-kW clamp (MaxChargeKW) applies
+// BEFORE the kW→A conversion, so a high per-unit amp headroom can never command
+// more than the pack can accept.
+func TestKwToAmpsAggregateCeiling(t *testing.T) {
 	fake := newFakeHA()
 	cfg := testCfg(t)
 	cfg.MaxChargeKW = 8
-	a, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, ModeLive)
+	a, err := New(cfg, testRates(t), fake, ModeLive)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	fake.setState(voltEntity, "52.8")
-	fake.fresh[voltEntity] = true
-	got := a.kwToAmps(20) // clamps to 8 kW first → 8000/(52.8*2) ≈ 75.8 A, under the 100 A per-unit ceiling
-	want := 8 * 1000.0 / (52.8 * 2)
+	got := a.kwToAmps(20) // clamps to 8 kW first → 8000/(103*2) ≈ 38.8 A, under the 50 A per-unit ceiling
+	want := 8 * 1000.0 / (103.0 * 2)
 	if !approx(got, want) {
 		t.Fatalf("aggregate ceiling: got %.3f want %.3f", got, want)
-	}
-
-	fake.setState(voltEntity, "5.0") // glitched-low fresh voltage → use nominal
-	fake.fresh[voltEntity] = true
-	got = a.kwToAmps(5)
-	want = 5 * 1000.0 / (52.8 * 2)
-	if !approx(got, want) {
-		t.Fatalf("low-voltage guard: got %.3f want %.3f", got, want)
 	}
 }
 
@@ -933,7 +924,7 @@ func TestPersistAtomicAndCorruptColdStart(t *testing.T) {
 	fake := newFakeHA()
 	seedWindows(fake)
 	fake.setState(switchEntity, switchOff)
-	a, err := New(cfg, config.Battery{NominalVoltageV: 52.8}, testRates(t), fake, ModeLive)
+	a, err := New(cfg, testRates(t), fake, ModeLive)
 	if err != nil {
 		t.Fatal(err)
 	}
