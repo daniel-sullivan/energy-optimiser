@@ -553,3 +553,55 @@ func TestChargeBlockFrom(t *testing.T) {
 		t.Errorf("nil slot: got target=%v end=%v, want 0 / zero", target, end)
 	}
 }
+
+// TestSocComfortFloorControlsChargeDepth verifies the configurable comfort floor
+// actually governs how full the optimiser keeps the pack: a higher floor makes it
+// grid-charge more in off-peak to hold a higher SoC through a following peak. This
+// is the knob that tunes overnight grid over-provisioning.
+func TestSocComfortFloorControlsChargeDepth(t *testing.T) {
+	solveFloor := func(floor float64) *Schedule {
+		const T = 8
+		rates := make([]float64, T)
+		off := make([]bool, T)
+		load := make([]float64, T)
+		for i := range T {
+			load[i] = 3
+			if i < 4 { // 0-3 off-peak (cheap), 4-7 peak (expensive)
+				off[i] = true
+				rates[i] = 10
+			} else {
+				rates[i] = 40
+			}
+		}
+		in := &Input{
+			Now: time.Date(2024, 1, 15, 1, 0, 0, 0, time.UTC), NumSlots: T, SlotMinutes: 30,
+			SolarKW: make([]float64, T), LoadKW: load, Rates: rates, IsOffPeak: off,
+			CurrentSOC: 0.55,
+			Battery:    config.Battery{CapacityKWh: 20, MaxChargeKW: 5, MaxDischargeKW: 5, SOCMin: 0.10, SOCMax: 1.0, Efficiency: 0.95},
+			PeakRate:   40, SOCRiskWeight: 2.0, MinChargeKW: 1.0, BlipCost: 5.0,
+			SocComfortFloor: floor,
+		}
+		fillUniform(in)
+		s, err := Solve(in)
+		if err != nil {
+			t.Fatalf("solve floor=%.2f: %v", floor, err)
+		}
+		return s
+	}
+	minSoC := func(s *Schedule) float64 {
+		m := 1.0
+		for _, sl := range s.Slots {
+			if sl.SOC < m {
+				m = sl.SOC
+			}
+		}
+		return m
+	}
+
+	hi := minSoC(solveFloor(0.50))
+	lo := minSoC(solveFloor(0.25))
+	if hi <= lo+1e-6 {
+		t.Errorf("higher comfort floor must hold a higher SoC trough: floor 0.50 -> %.3f, floor 0.25 -> %.3f", hi, lo)
+	}
+	t.Logf("min SoC: floor 0.50 -> %.1f%%, floor 0.25 -> %.1f%%", hi*100, lo*100)
+}

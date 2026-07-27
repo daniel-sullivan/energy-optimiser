@@ -14,11 +14,15 @@ import (
 // truncated (possibly sub-optimal) schedule.
 const solveTimeLimit = 30 * time.Second
 
-// SOC penalty thresholds (fraction of capacity).
+// SOC penalty thresholds. The comfort tier is configurable (Input.SocComfortFloor);
+// the two stronger tiers sit these offsets below it, so the default 0.5 comfort
+// floor reproduces the original fixed (0.5 / 0.3 / 0.2) ladder. A derived tier ≤ 0
+// is simply never binding (soc is always above it), which is the intended graceful
+// behaviour as the comfort floor is lowered toward the real SOCMin.
 const (
-	socThreshLow  = 0.5
-	socThreshMed  = 0.3
-	socThreshHigh = 0.2
+	socComfortFloorDefault = 0.5
+	socThreshMedOffset     = 0.2 // med tier = comfort − 0.2
+	socThreshHighOffset    = 0.3 // high tier = comfort − 0.3
 )
 
 // SOC penalty weights relative to SOCRiskWeight.
@@ -61,6 +65,16 @@ func Solve(in *Input) (*Schedule, error) {
 	// (socMin ≤ current) keeps a genuinely-low battery from being infeasible too.
 	cur := math.Min(in.Battery.SOCMax, math.Max(0, in.CurrentSOC))
 	socMin := math.Min(in.Battery.SOCMin, cur)
+
+	// Graded SoC-risk penalty tiers, anchored on the configurable comfort floor
+	// (the SoC grid charging keeps the pack at overnight). The two stronger tiers
+	// sit fixed offsets below it; default 0.5 → the original (0.5 / 0.3 / 0.2).
+	socThreshLow := in.SocComfortFloor
+	if socThreshLow <= 0 {
+		socThreshLow = socComfortFloorDefault
+	}
+	socThreshMed := socThreshLow - socThreshMedOffset
+	socThreshHigh := socThreshLow - socThreshHighOffset
 
 	// SOC penalties are scaled into currency (¥) via the peak rate so battery
 	// protection is comparable to grid-import cost under JPY.
@@ -210,19 +224,19 @@ func Solve(in *Input) (*Schedule, error) {
 		}
 		m.AddConstraint(startTerms, milp.GreaterEq, 0)
 
-		// 7. pen_low + soc[t+1] ≥ 0.5
+		// 7. pen_low + soc[t+1] ≥ comfort floor
 		m.AddConstraint([]milp.Term{
 			{Var: penLow[t], Coef: 1},
 			{Var: soc[t+1], Coef: 1},
 		}, milp.GreaterEq, socThreshLow)
 
-		// 8. pen_med + soc[t+1] ≥ 0.3
+		// 8. pen_med + soc[t+1] ≥ comfort − 0.2
 		m.AddConstraint([]milp.Term{
 			{Var: penMed[t], Coef: 1},
 			{Var: soc[t+1], Coef: 1},
 		}, milp.GreaterEq, socThreshMed)
 
-		// 9. pen_high + soc[t+1] ≥ 0.2
+		// 9. pen_high + soc[t+1] ≥ comfort − 0.3
 		m.AddConstraint([]milp.Term{
 			{Var: penHigh[t], Coef: 1},
 			{Var: soc[t+1], Coef: 1},

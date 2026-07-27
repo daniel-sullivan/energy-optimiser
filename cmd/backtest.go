@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	backtestFrom string
-	backtestDays int
+	backtestFrom     string
+	backtestDays     int
+	backtestSocFloor float64
 )
 
 // backtestCmd replays historical actuals through the optimizer to inspect when
@@ -32,6 +33,9 @@ var backtestCmd = &cobra.Command{
 		cfg, err := config.Parse(cfgFile)
 		if err != nil {
 			return err
+		}
+		if backtestSocFloor > 0 {
+			cfg.Optimizer.SocComfortFloor = backtestSocFloor // sweep override
 		}
 		loc := cfg.Location()
 
@@ -163,8 +167,8 @@ var backtestCmd = &cobra.Command{
 
 		fmt.Printf("Backtest %s → %s  (%d ticks @ %s slots, %dh horizon, perfect foresight)\n",
 			from.Format("2006-01-02"), to.Format("2006-01-02"), nTicks, slotDur, horizonSlots*slotMins/60)
-		fmt.Printf("Battery %.1f kWh, η=%.2f, soc_risk_weight=%.1f, blip_cost=¥%.1f\n",
-			capKWh, cfg.Battery.Efficiency, cfg.Optimizer.SOCRiskWeight, cfg.Optimizer.BlipCost)
+		fmt.Printf("Battery %.1f kWh, η=%.2f, soc_risk_weight=%.1f, soc_comfort_floor=%.2f, blip_cost=¥%.1f\n",
+			capKWh, cfg.Battery.Efficiency, cfg.Optimizer.SOCRiskWeight, cfg.Optimizer.SocComfortFloor, cfg.Optimizer.BlipCost)
 		fmt.Printf("Sim SoC: start %.0f%%, range %.0f%%–%.0f%%\n\n", socFrac[0]*100, minSoC*100, maxSoC*100)
 
 		if len(log) == 0 {
@@ -313,9 +317,7 @@ func telescopeUniform(uniform []float64, g optimizer.Grid, slotMins int) []float
 	u := 0
 	for k := range out {
 		n := int(math.Round(g.Hours[k] * 60 / float64(slotMins)))
-		if n < 1 {
-			n = 1
-		}
+		n = max(n, 1)
 		var sum float64
 		var c int
 		for j := 0; j < n; j++ {
@@ -335,5 +337,6 @@ func telescopeUniform(uniform []float64, g optimizer.Grid, slotMins int) []float
 func init() {
 	backtestCmd.Flags().StringVar(&backtestFrom, "from", "", "start date YYYY-MM-DD (default: --days ago)")
 	backtestCmd.Flags().IntVar(&backtestDays, "days", 3, "number of days to backtest")
+	backtestCmd.Flags().Float64Var(&backtestSocFloor, "soc-floor", 0, "override optimizer.soc_comfort_floor for a tuning sweep (0 = use config)")
 	rootCmd.AddCommand(backtestCmd)
 }

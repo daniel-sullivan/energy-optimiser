@@ -87,6 +87,7 @@ confidence_threshold = 0.3  # below this, use conservative defaults
 min_charge_kw = 1.0         # a grid-charge permit must yield >= this (no empty-bypass)
 blip_cost = 5.0             # currency penalty per bypass entry (skips marginal windows)
 max_grid_import_kw = 10.0   # per-slot grid-import cap (kW), soft/penalised — the electrical service limit
+soc_comfort_floor = 0.40    # SoC the graded risk penalty defends; morning trough lands a few pts below. Lower to cut overnight grid over-provisioning. Default 0.50.
 
 # [load_model]
 # lookback_days = 30            # training window; also the SHAPE/percentile window

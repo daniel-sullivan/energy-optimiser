@@ -26,8 +26,13 @@ type Input struct {
 	FeedInRate    float64 // ¥/kWh export revenue (0 = curtailment, no revenue)
 	PeakRate      float64 // ¥/kWh, used to scale SOC penalties into currency units
 	SOCRiskWeight float64
-	MinChargeKW   float64 // a grid-charge permit must yield >= this
-	BlipCost      float64 // objective penalty per bypass entry (currency)
+	// SocComfortFloor is the SoC fraction the graded SoC-risk penalty defends
+	// (the comfort tier); the two stronger tiers are derived below it. ≤0 → 0.5
+	// (the original fixed ladder). Tests building Input directly get the 0.5
+	// default via the solver's guard.
+	SocComfortFloor float64
+	MinChargeKW     float64 // a grid-charge permit must yield >= this
+	BlipCost        float64 // objective penalty per bypass entry (currency)
 	// MaxGridImportKW is the per-slot grid-import cap (kW; the electrical
 	// connection limit). It is enforced as a SOFT bound: import above it is
 	// heavily penalised so the optimiser never plans to exceed it, but real load
@@ -85,6 +90,7 @@ func PrepareInput(
 		FeedInRate:      cfg.Rates.FeedInRate,
 		PeakRate:        cfg.Rates.PeakRate,
 		SOCRiskWeight:   cfg.Optimizer.SOCRiskWeight,
+		SocComfortFloor: cfg.Optimizer.SocComfortFloor,
 		MinChargeKW:     cfg.Optimizer.MinChargeKW,
 		BlipCost:        cfg.Optimizer.BlipCost,
 		MaxGridImportKW: cfg.Optimizer.MaxGridImportKW,

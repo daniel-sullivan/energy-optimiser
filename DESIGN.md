@@ -137,7 +137,14 @@ multiplying back to the configured round-trip efficiency.
 ```
 
 The SOC penalties are scaled into currency via the peak rate so battery
-protection is directly comparable to grid-import cost.
+protection is directly comparable to grid-import cost. The three penalty tiers are
+anchored on a configurable **comfort floor** (`optimizer.soc_comfort_floor`, the SoC
+the mildest tier defends); the two stronger tiers sit 0.2 and 0.3 below it, so the
+default 0.5 reproduces the original (0.5 / 0.3 / 0.2) ladder. Lowering it lets the
+battery cycle deeper before the penalty bites — the lever for how full overnight
+grid charging keeps the pack (the morning trough lands a few points below the
+floor). It is a comfort/economics knob, not a safety one: the hard `soc_min` bound
+and the derived lower tiers still defend the real floor.
 
 ### Constraints (9 kinds, per slot, plus one cross-slot budget)
 

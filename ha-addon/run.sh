@@ -166,6 +166,7 @@ CONFIDENCE_THRESHOLD=$(bashio::config 'optimizer.confidence_threshold')
 MIN_CHARGE_KW=$(bashio::config 'optimizer.min_charge_kw')
 BLIP_COST=$(bashio::config 'optimizer.blip_cost')
 MAX_GRID_IMPORT_KW=$(bashio::config 'optimizer.max_grid_import_kw')
+SOC_COMFORT_FLOOR=$(bashio::config 'optimizer.soc_comfort_floor')
 
 cat >> "${CONFIG}" <<EOF
 
@@ -175,6 +176,7 @@ confidence_threshold = ${CONFIDENCE_THRESHOLD}
 min_charge_kw = ${MIN_CHARGE_KW}
 blip_cost = ${BLIP_COST}
 max_grid_import_kw = ${MAX_GRID_IMPORT_KW}
+soc_comfort_floor = ${SOC_COMFORT_FLOOR}
 EOF
 
 # --- Actuator (grid-charge hardware limits) ---

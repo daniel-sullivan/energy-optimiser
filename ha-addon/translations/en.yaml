@@ -143,6 +143,13 @@ configuration:
       optimiser is heavily penalised for planning to draw above this, so it
       never charges beyond the cap; if real load alone exceeds it the plan stays
       valid rather than failing.
+  optimizer.soc_comfort_floor:
+    name: SoC Comfort Floor
+    description: >-
+      The state of charge (0–1) the optimiser tries to keep the battery at or
+      above overnight — the morning low lands a little below this. Lower it to
+      let the battery cycle deeper and grid-charge less; raise it to keep more
+      reserve. Default 0.5.
   actuator.max_charge_current_a:
     name: Max Charge Current (A/unit)
     description: >-

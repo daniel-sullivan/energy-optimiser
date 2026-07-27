@@ -268,6 +268,15 @@ type Optimizer struct {
 	// per-unit amp clamp, independent of this aggregate) are the two guards
 	// until one exists.
 	MaxGridImportKW float64 `toml:"max_grid_import_kw"`
+	// SocComfortFloor is the SoC (fraction) the optimiser tries to keep the
+	// battery at or above via the graded SoC-risk penalty — the "comfort" tier.
+	// It sets how full grid charging keeps the pack overnight: the morning SoC
+	// trough lands a few points below this. The two stronger penalty tiers are
+	// derived 0.2 and 0.3 below it, so the default 0.5 reproduces the original
+	// fixed (0.5 / 0.3 / 0.2) ladder. Lower it to let the battery cycle deeper
+	// (less grid over-provisioning) while the derived lower tiers still defend
+	// the real floor. 0/unset → 0.5 in finalize.
+	SocComfortFloor float64 `toml:"soc_comfort_floor"`
 }
 
 // LoadModel tunes the load model's recency/headroom estimation (see
@@ -538,6 +547,9 @@ func (c *Config) finalize() error {
 	}
 	if c.Optimizer.MaxGridImportKW == 0 {
 		c.Optimizer.MaxGridImportKW = 10.0
+	}
+	if c.Optimizer.SocComfortFloor == 0 {
+		c.Optimizer.SocComfortFloor = 0.5
 	}
 
 	if c.LoadModel.LookbackDays == 0 {
