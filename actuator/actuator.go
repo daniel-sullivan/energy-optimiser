@@ -74,9 +74,41 @@ type haClient interface {
 // conversion, the timed-charge window/current/enable sequencing, and the
 // off-peak hardware rail. The actuator re-derives the active off-peak window from
 // its own tariff config, so a window is never taken on trust from the caller.
+// ChargePlan is the policy's desired grid-charge state for the current tick, plus
+// the context the actuator needs to COMMIT to a contiguous charge block and ride
+// out the solver's per-tick hunting (see chargeCommitment). Charging/GridKW are
+// this tick's intent; CurrentSOC/TargetSOC/BlockEnd describe the block so the
+// actuator knows when the block is genuinely done rather than momentarily wobbling.
 type ChargePlan struct {
 	Charging bool
 	GridKW   float64
+	// CurrentSOC is the measured battery SoC now (fraction 0..1); negative if
+	// unknown, in which case the block exits on time/window rather than SoC.
+	CurrentSOC float64
+	// TargetSOC is the plan's SoC goal at the end of the current window's charge
+	// block (fraction 0..1). Reaching it is the primary, clean exit — it stops
+	// exactly when the block's goal is met, not when a single re-solve wobbles.
+	TargetSOC float64
+	// BlockEnd is the planned end time of the current charge block (a time backstop
+	// for when SoC is unknown or rises slower than planned; also the off-peak
+	// window cap). Zero when not charging.
+	BlockEnd time.Time
+}
+
+// chargeCommitment latches a charge block once it starts so the solver's per-tick
+// bang-bang hunting (Charging flipping true/false around the SoC target on
+// successive 5-min re-solves) can no longer toggle the timed-charge contactor.
+// While active, amps still track the plan (the healthy taper as SoC rises), but a
+// spurious Charging=false is ignored. It clears only on a genuine block-end exit:
+// measured SoC ≥ targetSOC, now ≥ blockEnd, out of the off-peak window, or a
+// safety/mode change. A fresh plan may EXTEND it (later blockEnd / higher target),
+// never shrink it. Loop-owned (single goroutine), not persisted — a restart
+// re-derives from the next plan tick, and the window rail + dead-man cap the worst
+// case.
+type chargeCommitment struct {
+	active    bool
+	targetSOC float64
+	blockEnd  time.Time
 }
 
 // chargeState is the actuator's commanded intent, owned exclusively by the single
@@ -127,6 +159,9 @@ type Actuator struct {
 
 	// Loop-owned (single goroutine):
 	st chargeState
+	// commit latches the current charge block so per-tick solver hunting can't
+	// toggle the contactor; see chargeCommitment.
+	commit chargeCommitment
 	// duringShutdown makes pause/awaitConfirmed use non-abortable waits for the
 	// final fail-safe, so the shutdown disable write is never dropped.
 	duringShutdown bool
@@ -334,6 +369,7 @@ func (a *Actuator) handlePlan(plan ChargePlan) error {
 	if !a.mode.actuates() {
 		slog.Info("actuator: policy (no-op in current mode)",
 			"mode", a.mode, "charging", plan.Charging, "grid_kw", round1(plan.GridKW))
+		a.commit = chargeCommitment{} // don't hold a block across a mode change
 		return nil
 	}
 
@@ -342,6 +378,30 @@ func (a *Actuator) handlePlan(plan ChargePlan) error {
 	// window rail (see ensureWindowsMirrorOffPeak) and the enable switch, off
 	// outside off-peak, are the other two layers.
 	_, off := a.rates.ActiveWindow(a.now())
+
+	// A committed block rides out the solver's per-tick hunting: while it holds, a
+	// spurious Charging=false does NOT stop the charge. It exits only when the block
+	// is genuinely done — SoC target reached, planned end passed, out of window.
+	if a.commit.active {
+		// Extend first (a fresh plan wanting more raises the target / pushes the end
+		// out), THEN test the exit — so a re-plan that wants to charge past the old
+		// target isn't stopped by the stale one.
+		a.extendCommitment(plan)
+		if reason, done := a.blockExit(plan, off); done {
+			return a.stopCharge(reason) // stopCharge clears the commitment
+		}
+		// Track the plan's amps while it wants charge; hold the last confirmed rate
+		// through a wobble (Charging=false / rounds-to-zero) so we keep charging.
+		amps := a.kwToAmps(plan.GridKW)
+		if !plan.Charging || round1(amps) <= 0 {
+			amps = a.st.amps
+		}
+		if round1(amps) <= 0 {
+			return nil // nothing sensible to command yet; hold (switch already on)
+		}
+		return a.startCharge(amps)
+	}
+
 	if !plan.Charging || !off {
 		return a.stopCharge("policy: no grid charge scheduled")
 	}
@@ -353,7 +413,42 @@ func (a *Actuator) handlePlan(plan ChargePlan) error {
 		return a.stopCharge("policy: grid charge rounds to zero")
 	}
 
+	// Begin a charge block. Latch only when the plan carries a block END time — the
+	// guaranteed time backstop (production always sets it via ChargeBlockFrom → slot
+	// End). Without one, fall back to per-tick behaviour so nothing can hold the
+	// contactor on until the window closes.
+	if !plan.BlockEnd.IsZero() {
+		a.commit = chargeCommitment{active: true, targetSOC: plan.TargetSOC, blockEnd: plan.BlockEnd}
+	}
 	return a.startCharge(amps)
+}
+
+// blockExit reports whether an active committed block is genuinely done (and why),
+// as opposed to the plan momentarily wobbling Charging=false. Order matters only
+// for the log reason; any one condition ends the block.
+func (a *Actuator) blockExit(plan ChargePlan, off bool) (string, bool) {
+	switch {
+	case !off:
+		return "block complete: off-peak window ended", true
+	case plan.CurrentSOC >= 0 && a.commit.targetSOC > 0 && plan.CurrentSOC >= a.commit.targetSOC:
+		return "block complete: SoC target reached", true
+	case !a.commit.blockEnd.IsZero() && !a.now().Before(a.commit.blockEnd):
+		return "block complete: planned block end reached", true
+	default:
+		return "", false
+	}
+}
+
+// extendCommitment lengthens a committed block's TIME backstop when a fresh plan
+// wants to charge later than first planned. It deliberately does NOT move the SoC
+// target: the target is snapshot at latch so forecast noise can't ratchet it up and
+// silently over-charge past the steady-state goal. A genuinely higher goal instead
+// ends this block cleanly at its target and re-latches a new one — a visible,
+// bounded re-plan within the ≤2-blips-per-window budget. The end never shrinks.
+func (a *Actuator) extendCommitment(plan ChargePlan) {
+	if plan.Charging && plan.BlockEnd.After(a.commit.blockEnd) {
+		a.commit.blockEnd = plan.BlockEnd
+	}
 }
 
 // startCharge establishes (or continues) grid charging. The charge windows are a
@@ -427,6 +522,9 @@ func (a *Actuator) adjustCurrent(amps float64) error {
 // re-drive it on the next tick — while a stale st=charging would wrongly suppress
 // exactly that retry.
 func (a *Actuator) stopCharge(reason string) error {
+	// Any genuine stop (policy exit, watchdog backstop, safety, shutdown) ends the
+	// committed block, so it can never re-start it on the next tick.
+	a.commit = chargeCommitment{}
 	if !a.mode.mayWrite() {
 		slog.Info("actuator: would stop grid charge (no-op in current mode)", "reason", reason, "mode", a.mode)
 		return nil

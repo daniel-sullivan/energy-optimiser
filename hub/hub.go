@@ -301,7 +301,7 @@ func (h *Hub) tick(ctx context.Context) {
 
 	slot := sched.CurrentSlot(now)
 	if slot != nil {
-		plan := h.buildChargePlan(now, slot, socKnown)
+		plan := h.buildChargePlan(now, sched, slot, currentSOC, socKnown)
 		if err := h.actuator.SetChargePlan(ctx, plan); err != nil {
 			slog.Error("actuator set charge plan", "error", err)
 		}
@@ -338,15 +338,21 @@ func (h *Hub) tick(ctx context.Context) {
 // (the solve ran on an assumed SOC purely for the dashboard). The actuator
 // re-derives the off-peak window it programs from its own tariff config, so the
 // plan carries only whether-to-charge and the grid kW.
-func (h *Hub) buildChargePlan(now time.Time, slot *optimizer.Slot, socKnown bool) actuator.ChargePlan {
+func (h *Hub) buildChargePlan(now time.Time, sched *optimizer.Schedule, slot *optimizer.Slot, currentSOC float64, socKnown bool) actuator.ChargePlan {
 	charging := socKnown && slot.GridCharge && h.cfg.Rates.IsOffPeak(now)
-	var gridKW float64
+	plan := actuator.ChargePlan{Charging: charging, CurrentSOC: -1}
+	if socKnown {
+		plan.CurrentSOC = currentSOC
+	}
 	if charging {
 		batteryChargeKW := math.Max(0, slot.BatteryFlowKW) // positive = charging
 		pvSurplus := math.Max(0, slot.SolarKW-slot.LoadKW) // PV available to self-charge
-		gridKW = math.Max(0, batteryChargeKW-pvSurplus)
+		plan.GridKW = math.Max(0, batteryChargeKW-pvSurplus)
+		// Block context so the actuator commits to the whole charge run and stops
+		// at its SoC goal rather than toggling on the solver's per-tick wobble.
+		plan.TargetSOC, plan.BlockEnd = sched.ChargeBlockFrom(slot)
 	}
-	return actuator.ChargePlan{Charging: charging, GridKW: gridKW}
+	return plan
 }
 
 // maybeRefreshSolar fetches a new solar forecast only when one of the

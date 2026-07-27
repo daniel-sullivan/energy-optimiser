@@ -44,3 +44,34 @@ func (s *Schedule) SlotAt(t time.Time) *Slot {
 	}
 	return nil
 }
+
+// ChargeBlockFrom returns the SoC goal and end time of the contiguous grid-charge
+// block beginning at slot cur. Per-window contiguity means grid-charge slots form a
+// single run, so the goal is the SoC at the end of the last consecutive GridCharge
+// slot and the end time is that slot's End. If cur is nil, not found, or not
+// charging, it falls back to cur's own SOC/End. The actuator uses these to commit
+// to a block and stop cleanly at its goal rather than toggling on solver wobble.
+func (s *Schedule) ChargeBlockFrom(cur *Slot) (targetSOC float64, blockEnd time.Time) {
+	if cur == nil {
+		return 0, time.Time{}
+	}
+	targetSOC, blockEnd = cur.SOC, cur.End
+	if s == nil {
+		return targetSOC, blockEnd
+	}
+	i := -1
+	for k := range s.Slots {
+		if s.Slots[k].Start.Equal(cur.Start) {
+			i = k
+			break
+		}
+	}
+	if i < 0 {
+		return targetSOC, blockEnd
+	}
+	for j := i; j < len(s.Slots) && s.Slots[j].GridCharge; j++ {
+		targetSOC = s.Slots[j].SOC
+		blockEnd = s.Slots[j].End
+	}
+	return targetSOC, blockEnd
+}

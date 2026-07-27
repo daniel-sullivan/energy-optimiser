@@ -977,3 +977,241 @@ func TestEnterWriteFailureSurfaces(t *testing.T) {
 		t.Fatal("failed start must not record charging")
 	}
 }
+
+// --- charge-block commitment (anti-flap) ---
+
+// blockEnd is a helper: a plan block ending at HH:MM Tokyo on the fixture day.
+func blockEnd(h, m int) time.Time { return time.Date(2026, 1, 15, h, m, 0, 0, tokyo) }
+
+// TestCommitmentRidesOutSolverFlapping is the headline regression for the 07-24
+// blip storm: once a block starts, the solver's per-tick Charging true/false
+// hunting must NOT toggle the timed-charge contactor. One turn_on, zero turn_off
+// while the block's SoC goal is unmet and its window/end have not passed.
+func TestCommitmentRidesOutSolverFlapping(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+
+	// Start a block: charge to 60% by 04:55, currently 49%.
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.60, BlockEnd: blockEnd(4, 55)})
+	if !a.st.charging {
+		t.Fatal("precondition: must be charging")
+	}
+	if !a.commit.active {
+		t.Fatal("precondition: block must be committed")
+	}
+
+	// Replay solver hunting: Charging flaps off/on repeatedly while SoC stays
+	// below target and time stays before the block end and inside the window.
+	for range 8 {
+		mustPlan(t, a, ChargePlan{Charging: false, CurrentSOC: 0.50, TargetSOC: 0.60, BlockEnd: blockEnd(4, 55)})
+		mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.51, TargetSOC: 0.60, BlockEnd: blockEnd(4, 55)})
+	}
+
+	if got := fake.countService("turn_off"); got != 0 {
+		t.Errorf("commitment must suppress flapping: got %d turn_off, want 0", got)
+	}
+	if got := fake.countService("turn_on"); got != 1 {
+		t.Errorf("commitment must keep one contiguous charge: got %d turn_on, want 1", got)
+	}
+	if !a.st.charging {
+		t.Error("must still be charging through the flapping")
+	}
+}
+
+// TestCommitmentExitsOnSocTarget: the clean, single exit — measured SoC reaching
+// the block's goal stops the charge exactly once.
+func TestCommitmentExitsOnSocTarget(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.60, BlockEnd: blockEnd(4, 55)})
+
+	// SoC reaches the goal — even though the plan still "wants" charge, the block is done.
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.60, TargetSOC: 0.60, BlockEnd: blockEnd(4, 55)})
+
+	if fake.countService("turn_off") != 1 {
+		t.Errorf("SoC-target must stop once: got %d turn_off", fake.countService("turn_off"))
+	}
+	if a.st.charging || a.commit.active {
+		t.Error("block must be cleared after SoC-target exit")
+	}
+	if fake.State(switchEntity) != switchOff || fake.StateFloat(ampsEntity) != 0 {
+		t.Error("stop must leave timed charge off and current zero")
+	}
+}
+
+// TestCommitmentExitsOnWindowEnd: leaving the off-peak window ends the block even
+// if SoC is still below target (the tariff rail wins).
+func TestCommitmentExitsOnWindowEnd(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.90, BlockEnd: blockEnd(4, 55)})
+
+	clock.set(outWindow) // 08:00 — peak
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.55, TargetSOC: 0.90, BlockEnd: blockEnd(4, 55)})
+
+	if fake.countService("turn_off") != 1 {
+		t.Errorf("window end must stop the block: got %d turn_off", fake.countService("turn_off"))
+	}
+	if a.commit.active {
+		t.Error("commitment must clear at window end")
+	}
+}
+
+// TestCommitmentExitsOnBlockEndTime: past the planned block end, stop even if SoC
+// is below target and still inside the window (time backstop for a slow rise).
+func TestCommitmentExitsOnBlockEndTime(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.90, BlockEnd: blockEnd(2, 30)})
+
+	clock.set(time.Date(2026, 1, 15, 2, 35, 0, 0, tokyo)) // past block end, still off-peak
+	mustPlan(t, a, ChargePlan{Charging: false, CurrentSOC: 0.55, TargetSOC: 0.90, BlockEnd: blockEnd(2, 30)})
+
+	if fake.countService("turn_off") != 1 {
+		t.Errorf("block-end time must stop the block: got %d turn_off", fake.countService("turn_off"))
+	}
+	if a.commit.active {
+		t.Error("commitment must clear at block-end time")
+	}
+}
+
+// TestCommitmentBlockEndExtendsNeverShrinks: a re-plan wanting to charge LATER
+// pushes the time backstop out; SoC still below target must keep charging past the
+// original planned end.
+func TestCommitmentBlockEndExtendsNeverShrinks(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.90, BlockEnd: blockEnd(3, 0)})
+
+	// Fresh solve pushes the end out 03:00→04:00 (SoC still well below target).
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.55, TargetSOC: 0.90, BlockEnd: blockEnd(4, 0)})
+	if !a.commit.blockEnd.Equal(blockEnd(4, 0)) {
+		t.Errorf("block end must extend to 04:00, got %v", a.commit.blockEnd)
+	}
+
+	// At 03:30 — past the OLD end, before the new one — it must still be charging.
+	clock.set(time.Date(2026, 1, 15, 3, 30, 0, 0, tokyo))
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.60, TargetSOC: 0.90, BlockEnd: blockEnd(4, 0)})
+	if fake.countService("turn_off") != 0 {
+		t.Errorf("extended end must not stop at the old end: got %d turn_off", fake.countService("turn_off"))
+	}
+	if !a.st.charging {
+		t.Error("must still be charging past the original block end")
+	}
+}
+
+// TestCommitmentTargetNotRatcheted: a higher plan target must NOT ratchet the block
+// goal up (forecast noise must not silently over-charge). The block exits at the
+// LATCH target; a genuinely higher goal re-latches a fresh, visible block.
+func TestCommitmentTargetNotRatcheted(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.55, BlockEnd: blockEnd(4, 55)})
+
+	// A tick emits a higher target (0.75) with SoC just past the LATCH target (0.55).
+	// The block must exit at 0.55 — not chase 0.75.
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.56, TargetSOC: 0.75, BlockEnd: blockEnd(4, 55)})
+	if fake.countService("turn_off") != 1 {
+		t.Errorf("must exit at the latch target, not ratchet to a higher one: got %d turn_off", fake.countService("turn_off"))
+	}
+	if a.commit.active {
+		t.Error("block must be cleared after latch-target exit")
+	}
+
+	// A sustained higher goal re-latches a new block (the visible, bounded re-plan).
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.56, TargetSOC: 0.75, BlockEnd: blockEnd(4, 55)})
+	if !a.commit.active || a.commit.targetSOC != 0.75 {
+		t.Errorf("a sustained higher goal must re-latch at 0.75, got active=%v target=%v", a.commit.active, a.commit.targetSOC)
+	}
+	if fake.countService("turn_on") != 2 {
+		t.Errorf("re-latch must be a visible new block: got %d turn_on, want 2", fake.countService("turn_on"))
+	}
+}
+
+// TestCommitmentHoldsWhenSocGoesStale: if SoC becomes unknown mid-block the hub
+// sends Charging=false + CurrentSOC=-1; the block must hold (no flapping) on the
+// time backstop and exit once when the planned end passes.
+func TestCommitmentHoldsWhenSocGoesStale(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.90, BlockEnd: blockEnd(2, 30)})
+
+	// SoC unknown for several ticks (still in window, before block end): hold.
+	for range 4 {
+		mustPlan(t, a, ChargePlan{Charging: false, CurrentSOC: -1, TargetSOC: 0.90, BlockEnd: blockEnd(2, 30)})
+	}
+	if fake.countService("turn_off") != 0 {
+		t.Errorf("stale SoC must not stop the block early: got %d turn_off", fake.countService("turn_off"))
+	}
+	if !a.st.charging {
+		t.Fatal("must still be charging with SoC unknown, before block end")
+	}
+
+	// Past the block end: the time backstop exits exactly once.
+	clock.set(time.Date(2026, 1, 15, 2, 35, 0, 0, tokyo))
+	mustPlan(t, a, ChargePlan{Charging: false, CurrentSOC: -1, TargetSOC: 0.90, BlockEnd: blockEnd(2, 30)})
+	if fake.countService("turn_off") != 1 || a.commit.active {
+		t.Errorf("block end must stop once when SoC is unknown: turn_off=%d active=%v", fake.countService("turn_off"), a.commit.active)
+	}
+}
+
+// TestWatchdogClearsActiveCommitment: the out-of-window watchdog disables timed
+// charge AND clears an active commitment, so the committed block can never re-start
+// the charge the watchdog just halted (the primary stuck-on backstop).
+func TestWatchdogClearsActiveCommitment(t *testing.T) {
+	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.90, BlockEnd: blockEnd(4, 55)})
+	if !a.commit.active || !a.st.charging {
+		t.Fatal("precondition: committed and charging")
+	}
+
+	// Clock jumps out of the off-peak window; the watchdog fires.
+	clock.set(outWindow)
+	submitSync(t, a, command{kind: cmdWatchdog})
+
+	if a.commit.active {
+		t.Error("watchdog must clear the commitment")
+	}
+	if a.st.charging || fake.State(switchEntity) != switchOff {
+		t.Error("watchdog must disable timed charge out of window")
+	}
+	// And a stale committed-looking plan must not re-start it.
+	onBefore := fake.countService("turn_on")
+	mustPlan(t, a, ChargePlan{Charging: false, CurrentSOC: 0.50, TargetSOC: 0.90, BlockEnd: blockEnd(4, 55)})
+	if fake.countService("turn_on") != onBefore {
+		t.Error("must not re-start after a watchdog stop")
+	}
+}
+
+// TestSafeStopClearsCommitment: a fail-safe/watchdog stop must clear the block so
+// the next committed tick cannot re-start the charge it just halted.
+func TestSafeStopClearsCommitment(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 8, CurrentSOC: 0.49, TargetSOC: 0.90, BlockEnd: blockEnd(4, 55)})
+	if !a.commit.active {
+		t.Fatal("precondition: committed")
+	}
+
+	submitSync(t, a, command{kind: cmdSafe, reason: "test fail-safe"})
+	if a.commit.active {
+		t.Fatal("safe stop must clear the commitment")
+	}
+	onBefore := fake.countService("turn_on")
+
+	// A committed-looking plan must NOT re-start (block was cleared).
+	mustPlan(t, a, ChargePlan{Charging: false, CurrentSOC: 0.50, TargetSOC: 0.90, BlockEnd: blockEnd(4, 55)})
+	if fake.countService("turn_on") != onBefore {
+		t.Error("must not re-start a charge after a fail-safe stop")
+	}
+	if a.st.charging {
+		t.Error("must remain stopped after fail-safe")
+	}
+}
+
+// TestNoBlockContextFallsBackToPerTick: a charge with no block target (defensive /
+// malformed plan) does not latch — a Charging=false stops immediately, so a bad
+// plan can never hold the contactor on until window end.
+func TestNoBlockContextFallsBackToPerTick(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5}) // no TargetSOC/BlockEnd
+	if a.commit.active {
+		t.Fatal("no block context must not latch a commitment")
+	}
+	mustPlan(t, a, ChargePlan{Charging: false})
+	if fake.countService("turn_off") != 1 || a.st.charging {
+		t.Errorf("without a block, Charging=false must stop at once: turn_off=%d charging=%v", fake.countService("turn_off"), a.st.charging)
+	}
+}

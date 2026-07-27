@@ -220,6 +220,27 @@ Actuation is mode-gated — `observe` (log only), `watchdog` (fail-safe writes
 only), `live` (full control) — resolved once at startup with a config-conflict
 guard.
 
+**Charge-block commitment (anti-flap).** The optimiser re-solves every
+`poll_interval` (5 min), and near the SoC target its current-slot grid-charge
+decision hunts — `charge`, then `no charge`, then `charge` — as SoC ticks up and
+the marginal benefit flips sign. Executed naïvely, that toggles the timed-charge
+contactor every few minutes (observed live 2026-07-24: ~8 on/off cycles in one
+window). The actuator instead **commits to the whole charge block**: when a charge
+starts, the plan carries the block's **target SoC** (the plan's SoC at the end of
+the contiguous grid-charge run in that window) and its **planned end time**. While
+committed the actuator keeps charging and ignores a spurious `Charging=false` — the
+per-unit *amps* still track the plan each tick (so the healthy taper as SoC rises is
+preserved), but the on/off switch does not move. It breaks out — once, cleanly —
+only when **measured SoC ≥ target**, the **planned end passes**, the **off-peak
+window ends**, or a **safety/mode change** (any `stopCharge`, including the watchdog
+backstop, clears the commitment so it can never re-start a halted charge). The SoC
+target is **fixed at latch** — a fresh solve can push the time backstop *later* but
+cannot raise the target, so forecast noise can't ratchet the goal up and silently
+over-charge; a genuinely higher goal ends this block cleanly at its target and
+re-latches a new one (visible, within the ≤2-blips-per-window budget). A charge with
+no block end does not latch — it falls back to per-tick behaviour, so a malformed
+plan can never hold the contactor on until the window ends.
+
 **Safety model.** The hazard is timed charge left *enabled* when it shouldn't be
 (unwanted/expensive grid charge, e.g. a crashed daemon leaving it on). Disabling
 is always the safe direction. The invariant: **timed charge is off whenever the

@@ -516,3 +516,40 @@ func TestGridImportCapStaysFeasibleWhenLoadForcesOverImport(t *testing.T) {
 	}
 	t.Logf("forced slot import %.2f kW (cap %.1f) — feasible, over-cap acknowledged", sched.Slots[0].GridImportKW, capKW)
 }
+
+// TestChargeBlockFrom verifies the contiguous-run target the actuator commits to:
+// the SoC and end time of the last consecutive GridCharge slot from the current one.
+func TestChargeBlockFrom(t *testing.T) {
+	base := time.Date(2026, 1, 15, 1, 0, 0, 0, time.UTC)
+	mk := func(i int, charge bool, soc float64) Slot {
+		start := base.Add(time.Duration(i) * 30 * time.Minute)
+		return Slot{Start: start, End: start.Add(30 * time.Minute), GridCharge: charge, SOC: soc}
+	}
+	sched := &Schedule{Slots: []Slot{
+		mk(0, true, 0.52),
+		mk(1, true, 0.56),
+		mk(2, true, 0.60),
+		mk(3, false, 0.60),
+		mk(4, false, 0.59),
+	}}
+
+	// From the first charging slot: target is slot 2's SoC/End (end of the run).
+	target, end := sched.ChargeBlockFrom(&sched.Slots[0])
+	if target != 0.60 || !end.Equal(sched.Slots[2].End) {
+		t.Errorf("from slot0: got target=%v end=%v, want 0.60 / %v", target, end, sched.Slots[2].End)
+	}
+	// From mid-run: same block target.
+	target, end = sched.ChargeBlockFrom(&sched.Slots[1])
+	if target != 0.60 || !end.Equal(sched.Slots[2].End) {
+		t.Errorf("from slot1: got target=%v end=%v, want 0.60 / %v", target, end, sched.Slots[2].End)
+	}
+	// From a non-charging slot: falls back to that slot's own SoC/End.
+	target, end = sched.ChargeBlockFrom(&sched.Slots[3])
+	if target != 0.60 || !end.Equal(sched.Slots[3].End) {
+		t.Errorf("from non-charging slot3: got target=%v end=%v, want its own 0.60 / %v", target, end, sched.Slots[3].End)
+	}
+	// Nil slot is safe.
+	if target, end := sched.ChargeBlockFrom(nil); target != 0 || !end.IsZero() {
+		t.Errorf("nil slot: got target=%v end=%v, want 0 / zero", target, end)
+	}
+}
