@@ -81,22 +81,26 @@ samples, bucketed by:
 - **Fixed** categories: `hour × season`
 - **Routine** categories: `hour × day-of-week × season`
 
-Each bucket predicts a **LEVEL × SHAPE** product rather than a flat mean over
-the whole lookback window (which dilutes a real step-change in household
+Each bucket predicts its own **recency-weighted mean** rather than a flat mean
+over the whole lookback window (which dilutes a real step-change in household
 baseline — e.g. a doubled load over a few days gets averaged against 30 days
-of the old baseline): LEVEL is an exponentially recency-decayed mean across
-all samples (`recency_half_life_days`, default 3), tracking the current
-baseline within days; SHAPE is each bucket's high-percentile
-(`percentile`, default p75) relative to the wide-window overall mean, so
-peaky hour-of-day patterns bias predictions up instead of averaging spikes
-away. Prediction looks up the bucket for the target slot's time, falling back
+of the old baseline): each bucket's prediction is an exponentially
+recency-decayed mean of that bucket's own samples (`bucket_half_life_days`,
+default 10 — longer than the level half-life so a bucket seeing ~one sample a
+day isn't noisy), which tracks both the load LEVEL and its hour-of-day/seasonal
+SHAPE drift together, without the double-counting a separate level×percentile
+form suffers on a step-change. A wider recency-decayed overall LEVEL
+(`recency_half_life_days`, default 3) is kept for drift detection and cold-start
+fallback. Prediction looks up the bucket for the target slot's time, falling back
 to a day-of-week-agnostic bucket and then the recency-tracked LEVEL (or a
 hardcoded default with no data at all) if a bucket has fewer than 3 samples.
 A per-bucket **confidence** score (sample-count coverage × a distribution-
 shift signal — how far the recency LEVEL has drifted from the wide-window
 mean) gates `optimizer.confidence_threshold`: a low-confidence bucket's
 prediction is scaled up by `load_model.conservative_margin` rather than
-trusted as-is. The same shift-aware score feeds `Model.Confidence()` (the
+trusted as-is (this margin, plus the optimizer's `soc_comfort_floor`, is the
+safety headroom that replaced the old percentile shape). The same shift-aware
+score feeds `Model.Confidence()` (the
 dashboard/rationale score); a `weather` circuit category and per-circuit
 deferrable-load splitting exist as
 extension points but aren't populated by the current training loop.

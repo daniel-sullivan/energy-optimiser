@@ -35,7 +35,7 @@ dashboard internals.
 - `cmd/` — Cobra CLI: `serve`, `backtest`, `verify`, config loading
 - `config/` — TOML configuration structs (battery, rates, loads, services), secret indirection (`env:VARNAME`), tariff-window logic
 - `forecast/` — Solcast solar forecast client (multi-site, cached) + Open-Meteo weather client (fetched, not yet wired into the load model)
-- `loadmodel/` — hour×dow×season bucket load profiles (recency-weighted level × percentile-headroom shape), trained from the time-series store, cold-start safe with a data-coverage + distribution-shift confidence score
+- `loadmodel/` — hour×dow×season bucket load profiles (each bucket's own recency-weighted mean, tracking level + shape drift together), trained from the time-series store, cold-start safe with a data-coverage + distribution-shift confidence score
 - `optimizer/` — go-milp problem builder, solver, typed schedule extraction
 - `influx/` — time-series client (VictoriaMetrics / any InfluxDB-line-protocol-compatible store): `/api/v1/export` queries, line-protocol writes
 - `ha/` — Home Assistant WebSocket client (state subscriptions, service calls)

@@ -34,6 +34,14 @@ const (
 	weatherRetryInterval = 10 * time.Minute
 	// solarResidualLogInterval rate-limits the learned-vs-Solcast RMSE log line.
 	solarResidualLogInterval = 1 * time.Hour
+	// loadRetrainInterval is how often the load model is retrained from history so
+	// its level/mean/confidence track a settling load instead of freezing at boot.
+	loadRetrainInterval = 24 * time.Hour
+	// loadRetrainTimeout bounds the background retrain's multi-week Influx pull so
+	// a slow/hung history query can't leave the retrain goroutine (and its
+	// single-flight guard) running indefinitely. The tick loop is unaffected either
+	// way because the retrain is off-thread; this just caps a stuck query.
+	loadRetrainTimeout = 3 * time.Minute
 )
 
 // Hub is the central coordinator that runs the 5-minute tick loop.
@@ -58,6 +66,15 @@ type Hub struct {
 	lastTick    time.Time
 	subscribers map[*serve.Subscriber]struct{}
 
+	// loadModelMu guards the h.loadModel POINTER only. A published
+	// *loadmodel.Model is immutable — never mutated after a swap — so the model's
+	// own Predict/Confidence methods need no internal locking; the ONLY shared
+	// mutable state is the pointer, which this RWMutex protects. The retrain
+	// builds a FRESH model off the tick goroutine and swaps the pointer under the
+	// write lock; every reader (tick Predict, LoadConfidence) goes through
+	// currentLoadModel under the read lock.
+	loadModelMu sync.RWMutex
+
 	// Refresh/log bookkeeping — touched only on the single-threaded tick path.
 	lastSolcastAttempt time.Time
 	lastWeatherAttempt time.Time
@@ -68,6 +85,13 @@ type Hub struct {
 	// must not launch while the previous is still running.
 	refreshMu      sync.Mutex
 	refreshRunning bool
+
+	// loadTrainMu single-flights the background load-model retrain (loadTrainRunning)
+	// and guards lastLoadTrain, which the retrain goroutine writes on a successful
+	// swap and the tick reads to decide whether a retrain is due.
+	loadTrainMu      sync.Mutex
+	loadTrainRunning bool
+	lastLoadTrain    time.Time
 
 	// accResolveMu single-flights the background accuracy actual-resolution so a
 	// slow metrics lookup never overlaps itself across ticks.
@@ -81,21 +105,17 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 		return nil, fmt.Errorf("actuator mode: %w", err)
 	}
 	h := &Hub{
-		cfg:     cfg,
-		solcast: forecast.NewSolcast(cfg.Solcast),
-		weather: forecast.NewWeather(cfg.Weather),
-		loadModel: loadmodel.New(cfg.Circuits, cfg.HomeAssistant.Entities.LoadPower, loadmodel.Params{
-			SouthernHemisphere:  cfg.Weather.Latitude < 0,
-			RecencyHalfLifeDays: cfg.LoadModel.RecencyHalfLifeDays,
-			Percentile:          cfg.LoadModel.Percentile,
-			ConfidenceThreshold: cfg.Optimizer.ConfidenceThreshold,
-			ConservativeMargin:  cfg.LoadModel.ConservativeMargin,
-		}),
+		cfg:         cfg,
+		solcast:     forecast.NewSolcast(cfg.Solcast),
+		weather:     forecast.NewWeather(cfg.Weather),
 		ha:          ha.New(cfg.HomeAssistant),
 		dryRun:      dryRun,
 		mode:        mode,
 		subscribers: make(map[*serve.Subscriber]struct{}),
 	}
+	// Initial (untrained) model published before any reader exists; Run trains a
+	// fresh one and swaps it in before starting the web server.
+	h.loadModel = h.newLoadModel()
 	h.notifier = alert.NewNotifier(cfg)
 
 	// InfluxDB — non-fatal in dry-run, load model falls back to defaults
@@ -200,14 +220,22 @@ func (h *Hub) Run(ctx context.Context) error {
 		h.decisionPub.PublishDiscovery()
 	}
 
-	// Train load model (skip if no InfluxDB)
+	// Train load model (skip if no InfluxDB). Synchronous and BEFORE the web
+	// server starts, so the first tick has a real trained model and no reader
+	// exists yet. Builds a fresh model and publishes it under the load-model lock,
+	// same as the periodic retrain — the initial untrained model from New is only
+	// a placeholder.
 	if h.influx != nil {
-		slog.Info("training load model")
-		lookback := time.Duration(h.cfg.LoadModel.LookbackDays*24) * time.Hour
-		if err := h.loadModel.Train(ctx, &loadDataSource{h.influx}, lookback); err != nil {
-			slog.Warn("load model training incomplete", "error", err)
+		now := time.Now().In(h.cfg.Location())
+		if m, err := h.buildTrainedLoadModel(ctx); err != nil {
+			slog.Warn("load model training incomplete — keeping default model", "error", err)
+		} else {
+			h.swapLoadModel(m)
+			h.loadTrainMu.Lock()
+			h.lastLoadTrain = now
+			h.loadTrainMu.Unlock()
+			slog.Info("load model ready", "confidence", fmt.Sprintf("%.2f", m.Confidence()))
 		}
-		slog.Info("load model ready", "confidence", fmt.Sprintf("%.2f", h.loadModel.Confidence()))
 	} else {
 		slog.Info("load model using defaults (no InfluxDB)")
 	}
@@ -272,6 +300,7 @@ func (h *Hub) tick(ctx context.Context) {
 		h.maybeRefreshSolar(ctx, now)
 	}
 	h.maybeRefreshWeather(ctx, now)
+	h.maybeRetrainLoadModel(ctx, now)
 
 	currentSOC := h.ha.StateFloat(h.cfg.HomeAssistant.Entities.BatterySOC) / 100.0
 	socKnown := currentSOC > 0
@@ -287,7 +316,9 @@ func (h *Hub) tick(ctx context.Context) {
 	grid := optimizer.BuildGrid(now, h.cfg)
 
 	solarKW := h.solarForecastSlots(grid, now)
-	loadW := h.loadModel.Predict(grid.Start)
+	// currentLoadModel (not h.loadModel directly): the retrain swaps the pointer
+	// from a background goroutine, so even the tick's own read must take the lock.
+	loadW := h.currentLoadModel().Predict(grid.Start)
 
 	input := optimizer.PrepareInput(now, h.cfg, solarKW, loadW, currentSOC)
 	sched, err := optimizer.Solve(input)
@@ -395,6 +426,101 @@ func (h *Hub) maybeRefreshSolar(ctx context.Context, now time.Time) {
 			return
 		}
 	}
+}
+
+// newLoadModel constructs a fresh, untrained load model from the current config.
+// Shared by New (the startup placeholder) and buildTrainedLoadModel (the trained
+// startup + retrain models) so the Params wiring lives in exactly one place.
+func (h *Hub) newLoadModel() *loadmodel.Model {
+	return loadmodel.New(h.cfg.Circuits, h.cfg.HomeAssistant.Entities.LoadPower, loadmodel.Params{
+		SouthernHemisphere:  h.cfg.Weather.Latitude < 0,
+		RecencyHalfLifeDays: h.cfg.LoadModel.RecencyHalfLifeDays,
+		BucketHalfLifeDays:  h.cfg.LoadModel.BucketHalfLifeDays,
+		ConfidenceThreshold: h.cfg.Optimizer.ConfidenceThreshold,
+		ConservativeMargin:  h.cfg.LoadModel.ConservativeMargin,
+	})
+}
+
+// buildTrainedLoadModel constructs a FRESH load model and trains it from InfluxDB
+// history over the configured lookback. It never mutates the live model — the
+// caller publishes the result via swapLoadModel only on success, preserving the
+// invariant that a published model is immutable. Returns an error so the caller
+// keeps the existing model rather than publish a partially-built one. Callable
+// off the tick goroutine; the ctx timeout is the caller's responsibility.
+func (h *Hub) buildTrainedLoadModel(ctx context.Context) (*loadmodel.Model, error) {
+	m := h.newLoadModel()
+	lookback := time.Duration(h.cfg.LoadModel.LookbackDays*24) * time.Hour
+	if err := m.Train(ctx, &loadDataSource{h.influx}, lookback); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// currentLoadModel returns the currently published load model under the read
+// lock. EVERY read of h.loadModel MUST route through here — including the tick's
+// own Predict call — because the retrain builds the replacement on a separate
+// goroutine and swaps the pointer concurrently (see loadModelMu).
+func (h *Hub) currentLoadModel() *loadmodel.Model {
+	h.loadModelMu.RLock()
+	defer h.loadModelMu.RUnlock()
+	return h.loadModel
+}
+
+// swapLoadModel atomically publishes m as the live load model under the write
+// lock. The previous model is immutable and simply drops out of reference.
+func (h *Hub) swapLoadModel(m *loadmodel.Model) {
+	h.loadModelMu.Lock()
+	h.loadModel = m
+	h.loadModelMu.Unlock()
+}
+
+// maybeRetrainLoadModel retrains the load model roughly once per day so
+// recentLevel / overallMean / confidence track a settling load level instead of
+// freezing at the last restart (the "stuck low confidence" failure that kept the
+// conservative margin latched and over-forecast the overnight deficit).
+//
+// The retrain builds a FRESH model on a background goroutine (single-flighted via
+// loadTrainRunning) with a bounded-time Influx pull and atomically swaps it in on
+// success. This keeps the slow multi-week history query and the model rebuild OFF
+// the tick goroutine — so a slow query never stalls the solve — and off any live
+// model a dashboard reader is holding, so it can never race Confidence()/Predict.
+// lastLoadTrain is recorded only AFTER a successful swap, so a failed or timed-out
+// retrain retries on the next tick rather than waiting a full day.
+func (h *Hub) maybeRetrainLoadModel(ctx context.Context, now time.Time) {
+	if h.influx == nil {
+		return
+	}
+	h.loadTrainMu.Lock()
+	due := h.lastLoadTrain.IsZero() || now.Sub(h.lastLoadTrain) >= loadRetrainInterval
+	if h.loadTrainRunning || !due {
+		h.loadTrainMu.Unlock()
+		return
+	}
+	h.loadTrainRunning = true
+	h.loadTrainMu.Unlock()
+
+	go func() {
+		defer func() {
+			h.loadTrainMu.Lock()
+			h.loadTrainRunning = false
+			h.loadTrainMu.Unlock()
+		}()
+
+		tctx, cancel := context.WithTimeout(ctx, loadRetrainTimeout)
+		defer cancel()
+
+		slog.Info("retraining load model")
+		m, err := h.buildTrainedLoadModel(tctx)
+		if err != nil {
+			slog.Warn("load model retrain failed — keeping existing model", "error", err)
+			return // lastLoadTrain unchanged → retries next tick
+		}
+		h.swapLoadModel(m)
+		h.loadTrainMu.Lock()
+		h.lastLoadTrain = now
+		h.loadTrainMu.Unlock()
+		slog.Info("load model retrained", "confidence", fmt.Sprintf("%.2f", m.Confidence()))
+	}()
 }
 
 // maybeRefreshWeather refreshes the Open-Meteo GTI forecast on a periodic cadence,
@@ -659,7 +785,7 @@ func (h *Hub) Schedule() *optimizer.Schedule {
 	return h.schedule
 }
 
-func (h *Hub) LoadConfidence() float64 { return h.loadModel.Confidence() }
+func (h *Hub) LoadConfidence() float64 { return h.currentLoadModel().Confidence() }
 
 // Accuracy returns the rolling predicted-vs-actual window for the dashboard panel.
 func (h *Hub) Accuracy() serve.AccuracySnapshot { return h.accuracy.Snapshot() }

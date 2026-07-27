@@ -179,6 +179,20 @@ max_grid_import_kw = ${MAX_GRID_IMPORT_KW}
 soc_comfort_floor = ${SOC_COMFORT_FLOOR}
 EOF
 
+LOOKBACK_DAYS=$(bashio::config 'load_model.lookback_days')
+RECENCY_HALF_LIFE_DAYS=$(bashio::config 'load_model.recency_half_life_days')
+BUCKET_HALF_LIFE_DAYS=$(bashio::config 'load_model.bucket_half_life_days')
+CONSERVATIVE_MARGIN=$(bashio::config 'load_model.conservative_margin')
+
+cat >> "${CONFIG}" <<EOF
+
+[load_model]
+lookback_days = ${LOOKBACK_DAYS}
+recency_half_life_days = ${RECENCY_HALF_LIFE_DAYS}
+bucket_half_life_days = ${BUCKET_HALF_LIFE_DAYS}
+conservative_margin = ${CONSERVATIVE_MARGIN}
+EOF
+
 # --- Actuator (grid-charge hardware limits) ---
 MAX_CHARGE_CURRENT_A=$(bashio::config 'actuator.max_charge_current_a')
 AC_CHARGE_VOLTAGE_V=$(bashio::config 'actuator.ac_charge_voltage_v')

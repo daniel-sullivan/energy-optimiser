@@ -279,13 +279,13 @@ type Optimizer struct {
 	SocComfortFloor float64 `toml:"soc_comfort_floor"`
 }
 
-// LoadModel tunes the load model's recency/headroom estimation (see
-// loadmodel.Model). It replaces a flat arithmetic mean over the whole
-// training window — which dilutes a recent step-change in household load —
-// with a recency-weighted LEVEL times a percentile-headroom SHAPE.
+// LoadModel tunes the load model's recency estimation (see loadmodel.Model).
+// It replaces a flat arithmetic mean over the whole training window — which
+// dilutes a recent step-change in household load — with per-hour-of-day
+// recency-weighted bucket means that track LEVEL and SHAPE drift together.
 type LoadModel struct {
 	// LookbackDays is how far back Train() reads samples from the time-series
-	// store; also the window the per-bucket SHAPE/percentile is computed over.
+	// store; also the window the per-bucket means are computed over.
 	// Default 30.
 	LookbackDays float64 `toml:"lookback_days"`
 	// RecencyHalfLifeDays exponentially decays a training sample's weight by
@@ -294,11 +294,12 @@ type LoadModel struct {
 	// tracked within days instead of being diluted across the full lookback.
 	// Default 3.
 	RecencyHalfLifeDays float64 `toml:"recency_half_life_days"`
-	// Percentile (0-1) is used instead of the mean for each bucket's
-	// hour-of-day/season SHAPE, so peaky buckets (e.g. a kettle + induction
-	// hob at breakfast) bias predictions up rather than being averaged away.
-	// Default 0.75 (p75).
-	Percentile float64 `toml:"percentile"`
+	// BucketHalfLifeDays exponentially decays a training sample's weight by age
+	// when computing each hour-of-day bucket's recency-weighted mean (the
+	// prediction). Longer than the level half-life because each bucket sees
+	// ~1 sample/day, so a short half-life leaves too few effective samples.
+	// Default 10.
+	BucketHalfLifeDays float64 `toml:"bucket_half_life_days"`
 	// ConservativeMargin multiplies a bucket's prediction when its confidence
 	// is below Optimizer.ConfidenceThreshold. Default 1.3 (+30%).
 	ConservativeMargin float64 `toml:"conservative_margin"`
@@ -558,8 +559,8 @@ func (c *Config) finalize() error {
 	if c.LoadModel.RecencyHalfLifeDays == 0 {
 		c.LoadModel.RecencyHalfLifeDays = 3
 	}
-	if c.LoadModel.Percentile == 0 {
-		c.LoadModel.Percentile = 0.75
+	if c.LoadModel.BucketHalfLifeDays == 0 {
+		c.LoadModel.BucketHalfLifeDays = 10
 	}
 	if c.LoadModel.ConservativeMargin == 0 {
 		c.LoadModel.ConservativeMargin = 1.3

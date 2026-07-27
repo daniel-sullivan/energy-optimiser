@@ -124,7 +124,10 @@ func TestResolveActualsErrorRetries(t *testing.T) {
 
 func TestPersistenceRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	slot0 := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
+	// Anchor relative to now: load() prunes slots older than the retention
+	// window, so a hardcoded absolute date silently ages out of the window and
+	// fails the round-trip once the test is run more than accuracyWindow later.
+	slot0 := time.Now().Add(-time.Hour).Truncate(30 * time.Minute).UTC()
 
 	r1 := newAccuracyRecorder(dir, 30*time.Minute, nil, "pv", "grid")
 	r1.Record(accuracyTick{Now: slot0, HasSolcast: true, SolcastKW: 2.2, HasPlan: true, PlannedSOC: 0.7})

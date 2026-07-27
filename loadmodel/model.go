@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"sort"
 	"time"
 
 	"energy-optimiser/config"
@@ -67,13 +66,14 @@ type bucketKey struct {
 }
 
 // bucketStats holds a bucket's arithmetic mean (Sum/Count — sample-count
-// confidence, diagnostics) and its headroom percentile (Pct — the
-// CircuitModel.percentile-th percentile of the bucket's samples, computed
-// once at the end of training).
+// confidence, diagnostics) and its recency-weighted mean (WSum/Weight — the
+// prediction, decayed with the bucket half-life so both LEVEL and hour-of-day
+// SHAPE drift are tracked together with no double-count).
 type bucketStats struct {
-	Sum   float64
-	Count int
-	Pct   float64
+	Sum    float64 // raw sum — sample-count confidence + diagnostics
+	Count  int
+	WSum   float64 // decay-weighted sum (bucket half-life)
+	Weight float64 // Σ decay weights
 }
 
 func (b bucketStats) Mean() float64 {
@@ -81,6 +81,15 @@ func (b bucketStats) Mean() float64 {
 		return 0
 	}
 	return b.Sum / float64(b.Count)
+}
+
+// RecentMean is the bucket's recency-weighted mean — the prediction. Falls
+// back to the plain mean when no decay weight has accumulated.
+func (b bucketStats) RecentMean() float64 {
+	if b.Weight > 0 {
+		return b.WSum / b.Weight
+	}
+	return b.Mean()
 }
 
 // CircuitModel holds the learned profile for a single circuit.
@@ -92,19 +101,19 @@ type CircuitModel struct {
 	Default  float64 // conservative default (W), used only when there is no training data at all
 
 	// overallMean is the plain (unweighted) mean of every sample seen during
-	// training, across the whole lookback window — the normalizing
-	// denominator for bucketStats.Pct, turning it into a relative
-	// hour-of-day/season SHAPE ratio independent of the current baseline.
+	// training, across the whole lookback window — the current-vs-baseline
+	// LEVEL divergence denominator used by shiftConfidence to detect drift.
 	overallMean float64
 	// recentLevel is the recency-decay-weighted mean of every sample seen
 	// during training (see recencyHalfLifeDays) — the current baseline LEVEL,
 	// tracking a step change within days instead of being diluted by the full
-	// lookback window the way a flat mean is.
+	// lookback window the way a flat mean is. Drives drift detection and the
+	// cold-start fallback.
 	recentLevel float64
 
 	southernHemisphere  bool
 	recencyHalfLifeDays float64
-	percentile          float64
+	bucketHalfLifeDays  float64
 	confidenceThreshold float64
 	conservativeMargin  float64
 }
@@ -125,10 +134,12 @@ type Params struct {
 	// RecencyHalfLifeDays is the exponential-decay half-life (in days) used to
 	// weight training samples by age when computing the LEVEL. Default 3.
 	RecencyHalfLifeDays float64
-	// Percentile (0-1) is used instead of the mean for each bucket's
-	// hour-of-day/season SHAPE, so peaky buckets bias predictions up rather
-	// than being averaged away. Default 0.75 (p75).
-	Percentile float64
+	// BucketHalfLifeDays is the exponential-decay half-life (in days) used to
+	// weight training samples by age when computing each hour-of-day bucket's
+	// recency-weighted mean (the prediction). Longer than the level half-life
+	// because each bucket sees ~1 sample/day, so a short half-life leaves too
+	// few effective samples. Default 10.
+	BucketHalfLifeDays float64
 	// ConfidenceThreshold: predictions for a bucket whose confidence (see
 	// CircuitModel.bucketConfidence) falls below this are scaled up by
 	// ConservativeMargin. 0 disables the gate.
@@ -140,7 +151,7 @@ type Params struct {
 
 const (
 	defaultRecencyHalfLifeDays = 3.0
-	defaultPercentile          = 0.75
+	defaultBucketHalfLifeDays  = 10.0
 	defaultConservativeMargin  = 1.3
 )
 
@@ -151,8 +162,8 @@ func New(circuits []config.Circuit, wholeHouseEntity string, p Params) *Model {
 	if p.RecencyHalfLifeDays <= 0 {
 		p.RecencyHalfLifeDays = defaultRecencyHalfLifeDays
 	}
-	if p.Percentile <= 0 || p.Percentile > 1 {
-		p.Percentile = defaultPercentile
+	if p.BucketHalfLifeDays <= 0 {
+		p.BucketHalfLifeDays = defaultBucketHalfLifeDays
 	}
 	if p.ConservativeMargin <= 0 {
 		p.ConservativeMargin = defaultConservativeMargin
@@ -185,19 +196,24 @@ func newCircuitModel(name, entityID, category string, dflt float64, p Params) *C
 
 		southernHemisphere:  p.SouthernHemisphere,
 		recencyHalfLifeDays: p.RecencyHalfLifeDays,
-		percentile:          p.Percentile,
+		bucketHalfLifeDays:  p.BucketHalfLifeDays,
 		confidenceThreshold: p.ConfidenceThreshold,
 		conservativeMargin:  p.ConservativeMargin,
 	}
 }
 
-// Train fetches historical data from src and builds bucket profiles.
+// Train fetches historical data from src and builds bucket profiles over the
+// window [now-lookback, now).
 func (m *Model) Train(ctx context.Context, src DataSource, lookback time.Duration) error {
 	to := time.Now()
-	from := to.Add(-lookback)
+	return m.TrainWindow(ctx, src, to.Add(-lookback), to)
+}
 
-	all := m.allModels()
-	for _, cm := range all {
+// TrainWindow builds bucket profiles from src over [from,to). Decay ages are
+// measured relative to `to`, so a caller can reconstruct the model as it would
+// have been at an arbitrary past instant (walk-forward validation, no leakage).
+func (m *Model) TrainWindow(ctx context.Context, src DataSource, from, to time.Time) error {
+	for _, cm := range m.allModels() {
 		samples, err := src.QueryPower(ctx, cm.EntityID, from, to)
 		if err != nil {
 			slog.Warn("training failed for circuit", "name", cm.Name, "error", err)
@@ -222,7 +238,6 @@ func (cm *CircuitModel) trainFrom(samples []Sample, to time.Time) {
 		return
 	}
 
-	bucketValues := make(map[bucketKey][]float64)
 	var rawSum, weightedSum, weightSum float64
 	for _, s := range samples {
 		key := cm.key(s.Time)
@@ -231,14 +246,18 @@ func (cm *CircuitModel) trainFrom(samples []Sample, to time.Time) {
 			b = &bucketStats{}
 			cm.Buckets[key] = b
 		}
+		ageDays := to.Sub(s.Time).Hours() / 24
+		wLevel := decayWeight(ageDays, cm.recencyHalfLifeDays)
+		wBucket := decayWeight(ageDays, cm.bucketHalfLifeDays)
+
 		b.Sum += s.Value
 		b.Count++
-		bucketValues[key] = append(bucketValues[key], s.Value)
+		b.WSum += wBucket * s.Value
+		b.Weight += wBucket
 
 		rawSum += s.Value
-		w := decayWeight(to.Sub(s.Time).Hours()/24, cm.recencyHalfLifeDays)
-		weightedSum += w * s.Value
-		weightSum += w
+		weightedSum += wLevel * s.Value
+		weightSum += wLevel
 	}
 
 	cm.overallMean = rawSum / float64(len(samples))
@@ -246,9 +265,6 @@ func (cm *CircuitModel) trainFrom(samples []Sample, to time.Time) {
 		cm.recentLevel = weightedSum / weightSum
 	} else {
 		cm.recentLevel = cm.overallMean
-	}
-	for key, b := range cm.Buckets {
-		b.Pct = percentileOf(bucketValues[key], cm.percentile)
 	}
 }
 
@@ -259,27 +275,6 @@ func decayWeight(ageDays, halfLifeDays float64) float64 {
 		return 1
 	}
 	return math.Exp(-math.Ln2 * ageDays / halfLifeDays)
-}
-
-// percentileOf returns the p-th percentile (0-1) of values via linear
-// interpolation between closest ranks. values is not mutated.
-func percentileOf(values []float64, p float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	sorted := append([]float64(nil), values...)
-	sort.Float64s(sorted)
-	if len(sorted) == 1 {
-		return sorted[0]
-	}
-	rank := p * float64(len(sorted)-1)
-	lo := int(math.Floor(rank))
-	hi := int(math.Ceil(rank))
-	if lo == hi {
-		return sorted[lo]
-	}
-	frac := rank - float64(lo)
-	return sorted[lo] + frac*(sorted[hi]-sorted[lo])
 }
 
 // Predict returns predicted total load (W) for each slot time.
@@ -361,27 +356,17 @@ func (cm *CircuitModel) predictAt(t time.Time) float64 {
 	return cm.Default
 }
 
-// bucketPredict returns the bucket's LEVEL × SHAPE prediction — the
-// recency-weighted overall level scaled by the bucket's percentile-headroom
-// ratio to the wide-window mean — stepped up by conservativeMargin when the
-// bucket's confidence is below confidenceThreshold. ok is false when the
-// bucket doesn't have minSamples yet, so the caller should fall back.
+// bucketPredict returns the bucket's recency-weighted mean prediction (decayed
+// with the bucket half-life, so both LEVEL and hour-of-day SHAPE drift are
+// tracked together with no double-count), stepped up by conservativeMargin
+// when the bucket's confidence is below confidenceThreshold. ok is false when
+// the bucket doesn't have minSamples yet, so the caller should fall back.
 func (cm *CircuitModel) bucketPredict(k bucketKey) (float64, bool) {
 	b, ok := cm.Buckets[k]
 	if !ok || b.Count < minSamples {
 		return 0, false
 	}
-
-	level := cm.recentLevel
-	if level <= 0 {
-		level = cm.overallMean
-	}
-	ratio := 1.0
-	if cm.overallMean > 0 {
-		ratio = b.Pct / cm.overallMean
-	}
-	predicted := level * ratio
-
+	predicted := b.RecentMean()
 	if cm.confidenceThreshold > 0 && cm.bucketConfidence(k) < cm.confidenceThreshold {
 		predicted *= cm.conservativeMargin
 	}

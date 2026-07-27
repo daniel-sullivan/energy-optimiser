@@ -151,6 +151,12 @@ mise exec -- go run . backtest -c config.local.toml --days 7
 # Confirm the time-series datastore returns samples for every configured
 # entity (the load model degrades silently to defaults on an empty query).
 mise exec -- go run . verify -c config.local.toml
+
+# Walk-forward forecast-accuracy harness: for each past day, train the load
+# model only on prior data and compare predicted vs actual overnight kWh. Unlike
+# backtest (which replays actuals and bypasses the model), this measures the
+# forecast itself, and can sweep the per-bucket half-life for the best fit.
+mise exec -- go run . loadeval -c config.local.toml --days 14 --sweep "7,10,14,21"
 ```
 
 The dashboard is available at `http://localhost:8080` (or whatever
@@ -160,10 +166,10 @@ The dashboard is available at `http://localhost:8080` (or whatever
 
 | Package | Role |
 |---|---|
-| `cmd/` | Cobra CLI: `serve`, `backtest`, `verify` |
+| `cmd/` | Cobra CLI: `serve`, `backtest`, `verify`, `loadeval` |
 | `config/` | TOML configuration structs, secret indirection, tariff-window logic |
 | `forecast/` | Solcast solar forecast client (multi-site, cached); Open-Meteo weather client |
-| `loadmodel/` | Per-slot load prediction: recency-weighted level × percentile-headroom shape per hour × day-of-week × season bucket, trained from the time-series store, with a data-coverage + distribution-shift confidence score |
+| `loadmodel/` | Per-slot load prediction: each hour × day-of-week × season bucket's own recency-weighted mean (tracks load level and hour-of-day shape drift together), trained from the time-series store, with a data-coverage + distribution-shift confidence score |
 | `optimizer/` | go-milp problem builder, solver, typed schedule extraction |
 | `influx/` | Time-series client: queries via `/api/v1/export`, writes via InfluxDB line protocol |
 | `ha/` | Home Assistant WebSocket client: state subscriptions, service calls |
