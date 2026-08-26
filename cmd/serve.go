@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -33,15 +34,14 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	runCtx, stopRun := context.WithCancel(context.Background())
+	defer stopRun()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
 
-	runMode := "live"
-	if dryRun {
-		runMode = "dry-run"
-	}
 	slog.Info("starting energy optimiser",
-		"run_mode", runMode,
+		"run_mode", map[bool]string{false: "live", true: "dry-run"}[dryRun],
 		"web_port", cfg.Service.WebPort,
 		"poll_interval", cfg.Service.PollInterval,
 		"planning_horizon", cfg.Service.PlanningHorizon,
@@ -51,7 +51,17 @@ func runServe(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("creating hub: %w", err)
 	}
-	defer h.Close()
 
-	return h.Run(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- h.Run(runCtx) }()
+	select {
+	case err := <-runDone:
+		h.Close()
+		return err
+	case <-signals:
+		stopRun()
+		err := <-runDone
+		h.Close()
+		return err
+	}
 }

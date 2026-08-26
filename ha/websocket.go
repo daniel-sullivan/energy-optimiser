@@ -22,6 +22,8 @@ import (
 // transparently reconnects (re-auth, re-fetch, re-subscribe) whenever the
 // connection drops, so a network blip or an HA restart can never silently
 // freeze the cache at stale values.
+var subscribeTimeout = 15 * time.Second
+
 type Client struct {
 	url   string
 	token string
@@ -35,9 +37,19 @@ type Client struct {
 	mu         sync.RWMutex
 	states     map[string]EntityState
 	lastUpdate map[string]time.Time
+	generation map[string]uint64
 
 	connected atomic.Bool
+	closed    atomic.Bool
 	msgID     atomic.Int64
+
+	setupMu     sync.Mutex
+	subscribeMu sync.Mutex
+	setup       *stagedConnection
+
+	superviseMu     sync.Mutex
+	superviseCancel context.CancelFunc
+	superviseWG     sync.WaitGroup
 
 	// pending correlates command IDs to callers awaiting a `result` frame, so a
 	// service call can be confirmed (or fail on a drop). The read loop routes
@@ -65,6 +77,7 @@ func New(cfg config.HomeAssistant) *Client {
 		token:      cfg.Token,
 		states:     make(map[string]EntityState),
 		lastUpdate: make(map[string]time.Time),
+		generation: make(map[string]uint64),
 		pending:    make(map[int64]chan callResult),
 	}
 }
@@ -74,145 +87,302 @@ func New(cfg config.HomeAssistant) *Client {
 // misconfiguration; later drops are handled by the supervisor started in
 // SubscribeEvents.
 func (c *Client) Connect(ctx context.Context) error {
-	if err := c.dialAuth(ctx); err != nil {
+	if c.closed.Load() {
+		return errors.New("ha: closed")
+	}
+	conn, err := c.dialAuth(ctx)
+	if err != nil {
 		return err
 	}
-	if err := c.fetchStates(ctx); err != nil {
-		slog.Warn("ha: failed to fetch initial states", "error", err)
+	states, err := c.fetchStates(ctx, conn)
+	if err != nil {
+		_ = conn.Close(websocket.StatusInternalError, "initial state fetch failed")
+		return fmt.Errorf("ha fetch initial states: %w", err)
 	}
-	c.connected.Store(true)
+
+	c.setupMu.Lock()
+	defer c.setupMu.Unlock()
+	if c.closed.Load() {
+		_ = conn.Close(websocket.StatusNormalClosure, "shutdown")
+		return errors.New("ha: closed")
+	}
+	if c.setup != nil || c.currentConn() != nil {
+		_ = conn.Close(websocket.StatusPolicyViolation, "already connected")
+		return errors.New("ha: already connected")
+	}
+	c.setup = &stagedConnection{conn: conn, states: states}
 	return nil
 }
 
-// dialAuth dials the socket, performs the auth handshake on the local (not-yet-
-// published) connection, then publishes it under connMu and closes any prior
-// connection. The handshake reads/writes the local conn so it never races the
-// supervisor's read loop.
-func (c *Client) dialAuth(ctx context.Context) error {
+type fetchedState struct {
+	state   EntityState
+	at      time.Time
+	removed bool
+}
+
+type stagedConnection struct {
+	conn   *websocket.Conn
+	states map[string]fetchedState
+}
+
+func (c *Client) dialAuth(ctx context.Context) (*websocket.Conn, error) {
 	conn, _, err := websocket.Dial(ctx, c.url, nil)
 	if err != nil {
-		return fmt.Errorf("ha dial: %w", err)
+		return nil, fmt.Errorf("ha dial: %w", err)
 	}
-	conn.SetReadLimit(1 << 20) // 1 MB
-
+	conn.SetReadLimit(1 << 20)
+	fail := func(err error) (*websocket.Conn, error) {
+		_ = conn.Close(websocket.StatusInternalError, "setup failed")
+		return nil, err
+	}
 	var msg map[string]any
 	if err := wsjson.Read(ctx, conn, &msg); err != nil {
-		_ = conn.Close(websocket.StatusInternalError, "auth read")
-		return fmt.Errorf("ha read auth_required: %w", err)
+		return fail(fmt.Errorf("ha read auth_required: %w", err))
 	}
 	if msg["type"] != "auth_required" {
-		_ = conn.Close(websocket.StatusInternalError, "auth proto")
-		return fmt.Errorf("ha: expected auth_required, got %v", msg["type"])
+		return fail(fmt.Errorf("ha: expected auth_required, got %v", msg["type"]))
 	}
-	if err := wsjson.Write(ctx, conn, map[string]string{
-		"type":         "auth",
-		"access_token": c.token,
-	}); err != nil {
-		_ = conn.Close(websocket.StatusInternalError, "auth write")
-		return fmt.Errorf("ha send auth: %w", err)
+	if err := wsjson.Write(ctx, conn, map[string]string{"type": "auth", "access_token": c.token}); err != nil {
+		return fail(fmt.Errorf("ha send auth: %w", err))
 	}
 	if err := wsjson.Read(ctx, conn, &msg); err != nil {
-		_ = conn.Close(websocket.StatusInternalError, "auth result")
-		return fmt.Errorf("ha read auth result: %w", err)
+		return fail(fmt.Errorf("ha read auth result: %w", err))
 	}
 	if msg["type"] != "auth_ok" {
-		_ = conn.Close(websocket.StatusInternalError, "auth failed")
-		return fmt.Errorf("ha auth failed: %v", msg["type"])
-	}
-
-	c.connMu.Lock()
-	old := c.conn
-	c.conn = conn
-	c.connMu.Unlock()
-	if old != nil {
-		_ = old.Close(websocket.StatusNormalClosure, "reconnect")
+		return fail(fmt.Errorf("ha auth failed: %v", msg["type"]))
 	}
 	slog.Info("ha: authenticated", "version", msg["ha_version"])
-	return nil
+	return conn, nil
 }
 
-// fetchStates requests all current entity states. It holds connMu across the
-// correlated write+read so no other writer can interleave, and it runs only
-// when the read loop is not reading this connection (startup + reconnect), so
-// the synchronous read cannot swallow an event frame.
-func (c *Client) fetchStates(ctx context.Context) error {
-	// Bound the correlated read: connMu is held for the duration, so a half-open
-	// HA that authenticates but never answers get_states must not wedge writers
-	// (CallService/notify) behind this lock indefinitely — time out and let the
-	// supervisor retry with backoff.
+func (c *Client) fetchStates(ctx context.Context, conn *websocket.Conn) (map[string]fetchedState, error) {
+	return c.fetchStatesWithEvents(ctx, conn, false)
+}
+
+func (c *Client) fetchSubscribedStates(ctx context.Context, conn *websocket.Conn) (map[string]fetchedState, error) {
+	return c.fetchStatesWithEvents(ctx, conn, true)
+}
+
+func (c *Client) fetchStatesWithEvents(ctx context.Context, conn *websocket.Conn, subscribed bool) (map[string]fetchedState, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-	conn := c.conn
-	if conn == nil {
-		return errors.New("ha: not connected")
-	}
-
 	id := c.nextID()
-	if err := wsjson.Write(ctx, conn, map[string]any{
-		"id":   id,
-		"type": "get_states",
-	}); err != nil {
-		return err
+	if err := wsjson.Write(ctx, conn, map[string]any{"id": id, "type": "get_states"}); err != nil {
+		return nil, err
 	}
-
-	var resp struct {
-		Type   string `json:"type"`
-		Result []struct {
+	pending := make(map[string]fetchedState)
+	for {
+		var raw json.RawMessage
+		if err := wsjson.Read(ctx, conn, &raw); err != nil {
+			return nil, err
+		}
+		var resp struct {
+			ID      int64           `json:"id"`
+			Type    string          `json:"type"`
+			Success *bool           `json:"success"`
+			Result  json.RawMessage `json:"result"`
+			Error   *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+			Event *struct {
+				Data struct {
+					EntityID string `json:"entity_id"`
+					NewState *struct {
+						State      string         `json:"state"`
+						Attributes map[string]any `json:"attributes"`
+					} `json:"new_state"`
+				} `json:"data"`
+			} `json:"event"`
+		}
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return nil, fmt.Errorf("ha get_states response: %w", err)
+		}
+		if subscribed && resp.Type == "event" && resp.Event != nil {
+			entityID := resp.Event.Data.EntityID
+			if state := resp.Event.Data.NewState; state != nil {
+				pending[entityID] = fetchedState{
+					state: EntityState{EntityID: entityID, State: state.State, Attributes: state.Attributes},
+					at:    time.Now(),
+				}
+			} else {
+				pending[entityID] = fetchedState{removed: true}
+			}
+			continue
+		}
+		if resp.ID != id || resp.Type != "result" || resp.Success == nil || !*resp.Success {
+			message := "unsuccessful response"
+			if resp.Error != nil && resp.Error.Message != "" {
+				message = resp.Error.Message
+			}
+			return nil, fmt.Errorf("ha get_states: expected successful result id %d, got id=%d type=%q: %s", id, resp.ID, resp.Type, message)
+		}
+		var result []struct {
 			EntityID   string         `json:"entity_id"`
 			State      string         `json:"state"`
 			Attributes map[string]any `json:"attributes"`
-		} `json:"result"`
-	}
-	if err := wsjson.Read(ctx, conn, &resp); err != nil {
-		return err
-	}
-
-	now := time.Now()
-	c.mu.Lock()
-	for _, s := range resp.Result {
-		c.states[s.EntityID] = EntityState{
-			EntityID:   s.EntityID,
-			State:      s.State,
-			Attributes: s.Attributes,
 		}
-		c.lastUpdate[s.EntityID] = now
+		if err := json.Unmarshal(resp.Result, &result); err != nil {
+			return nil, fmt.Errorf("ha get_states result: %w", err)
+		}
+		now := time.Now()
+		states := make(map[string]fetchedState, len(result)+len(pending))
+		for _, s := range result {
+			states[s.EntityID] = fetchedState{state: EntityState{EntityID: s.EntityID, State: s.State, Attributes: s.Attributes}, at: now}
+		}
+		for entityID, state := range pending {
+			states[entityID] = state
+		}
+		return states, nil
+	}
+}
+
+func (c *Client) activate(conn *websocket.Conn, states map[string]fetchedState) error {
+	c.connMu.Lock()
+	if c.closed.Load() {
+		c.connMu.Unlock()
+		return errors.New("ha: closed")
+	}
+	old := c.conn
+	c.conn = conn
+	c.mu.Lock()
+	clear(c.states)
+	clear(c.lastUpdate)
+	for entityID, fetched := range states {
+		if fetched.removed {
+			continue
+		}
+		c.states[entityID] = fetched.state
+		c.lastUpdate[entityID] = fetched.at
+		c.generation[entityID]++
 	}
 	c.mu.Unlock()
-	slog.Info("ha: loaded states", "count", len(resp.Result))
+	c.connected.Store(true)
+	c.connMu.Unlock()
+	if old != nil && old != conn {
+		_ = old.Close(websocket.StatusNormalClosure, "reconnect")
+	}
+	slog.Info("ha: loaded states", "count", len(states))
 	return nil
 }
 
 // SubscribeEvents subscribes to state_changed and starts the supervisor that
-// owns the read loop and reconnects on drop. Must be called after Connect.
+// owns the read loop and reconnects on drop. Must be called after Connect. The
+// supervisor lives until Close so actuator shutdown can keep using the subscribed
+// connection after the service Run context has been cancelled.
 func (c *Client) SubscribeEvents(ctx context.Context) error {
-	if err := c.sendSubscribe(ctx); err != nil {
+	c.subscribeMu.Lock()
+	defer c.subscribeMu.Unlock()
+
+	c.superviseMu.Lock()
+	if c.superviseCancel != nil {
+		c.superviseMu.Unlock()
+		return nil
+	}
+	c.superviseMu.Unlock()
+
+	c.setupMu.Lock()
+	staged := c.setup
+	c.setupMu.Unlock()
+	if staged == nil {
+		return errors.New("ha: not connected")
+	}
+	if err := c.subscribe(ctx, staged.conn); err != nil {
+		c.discardSetup(staged)
+		_ = staged.conn.Close(websocket.StatusInternalError, "initial subscribe failed")
 		return fmt.Errorf("ha subscribe: %w", err)
 	}
-	go c.supervise(ctx)
+	states, err := c.fetchSubscribedStates(ctx, staged.conn)
+	if err != nil {
+		c.discardSetup(staged)
+		_ = staged.conn.Close(websocket.StatusInternalError, "post-subscribe state fetch failed")
+		return fmt.Errorf("ha fetch subscribed states: %w", err)
+	}
+	c.setupMu.Lock()
+	if c.setup != staged {
+		c.setupMu.Unlock()
+		_ = staged.conn.Close(websocket.StatusNormalClosure, "shutdown")
+		return errors.New("ha: closed")
+	}
+	c.setup = nil
+	c.setupMu.Unlock()
+	if err := c.activate(staged.conn, states); err != nil {
+		_ = staged.conn.Close(websocket.StatusNormalClosure, "shutdown")
+		return err
+	}
+
+	c.superviseMu.Lock()
+	if c.closed.Load() {
+		c.superviseMu.Unlock()
+		c.disconnectIfCurrent(staged.conn, errors.New("ha: closed"))
+		return errors.New("ha: closed")
+	}
+	supervisorCtx, cancel := context.WithCancel(context.Background())
+	c.superviseCancel = cancel
+	c.superviseWG.Add(1)
+	go func() {
+		defer c.superviseWG.Done()
+		c.supervise(supervisorCtx)
+	}()
+	c.superviseMu.Unlock()
 	return nil
 }
 
-func (c *Client) sendSubscribe(ctx context.Context) error {
-	return c.writeJSON(ctx, map[string]any{
-		"id":         c.nextID(),
+func (c *Client) discardSetup(staged *stagedConnection) {
+	c.setupMu.Lock()
+	if c.setup == staged {
+		c.setup = nil
+	}
+	c.setupMu.Unlock()
+}
+
+func (c *Client) subscribe(ctx context.Context, conn *websocket.Conn) error {
+	ctx, cancel := context.WithTimeout(ctx, subscribeTimeout)
+	defer cancel()
+	id := c.nextID()
+	if err := wsjson.Write(ctx, conn, map[string]any{
+		"id":         id,
 		"type":       "subscribe_events",
 		"event_type": "state_changed",
-	})
+	}); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	var resp struct {
+		ID      int64  `json:"id"`
+		Type    string `json:"type"`
+		Success *bool  `json:"success"`
+		Error   *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := wsjson.Read(ctx, conn, &resp); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if resp.ID != id || resp.Type != "result" || resp.Success == nil || !*resp.Success {
+		message := "unsuccessful response"
+		if resp.Error != nil && resp.Error.Message != "" {
+			message = resp.Error.Message
+		}
+		return fmt.Errorf("expected successful subscribe result id %d, got id=%d type=%q: %s", id, resp.ID, resp.Type, message)
+	}
+	return nil
 }
 
 // supervise runs the read loop and, whenever it returns before ctx is done,
 // reconnects with capped exponential backoff (re-auth, re-fetch, re-subscribe).
 func (c *Client) supervise(ctx context.Context) {
 	for {
-		err := c.readLoop(ctx, c.currentConn())
+		conn := c.currentConn()
+		err := c.readLoop(ctx, conn)
+		c.disconnectIfCurrent(conn, errors.New("ha: connection lost"))
 		if ctx.Err() != nil {
 			return
 		}
-		c.connected.Store(false)
-		c.failPending(errors.New("ha: connection lost"))
 		slog.Warn("ha: connection lost, reconnecting", "error", err)
 
 		backoff := time.Second
@@ -223,11 +393,13 @@ func (c *Client) supervise(ctx context.Context) {
 			case <-time.After(backoff):
 			}
 			if err := c.reconnect(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				slog.Warn("ha: reconnect failed", "error", err, "retry_in", backoff)
 				backoff = min(backoff*2, 30*time.Second)
 				continue
 			}
-			c.connected.Store(true)
 			slog.Info("ha: reconnected")
 			break
 		}
@@ -239,14 +411,30 @@ func (c *Client) supervise(ctx context.Context) {
 // Fetch precedes subscribe so the synchronous get_states read never races the
 // event stream.
 func (c *Client) reconnect(ctx context.Context) error {
-	if err := c.dialAuth(ctx); err != nil {
+	conn, err := c.dialAuth(ctx)
+	if err != nil {
 		return err
 	}
-	if err := c.fetchStates(ctx); err != nil {
+	if _, err := c.fetchStates(ctx, conn); err != nil {
+		_ = conn.Close(websocket.StatusInternalError, "refetch states")
 		return fmt.Errorf("refetch states: %w", err)
 	}
-	if err := c.sendSubscribe(ctx); err != nil {
+	if err := c.subscribe(ctx, conn); err != nil {
+		_ = conn.Close(websocket.StatusInternalError, "resubscribe")
 		return fmt.Errorf("resubscribe: %w", err)
+	}
+	states, err := c.fetchSubscribedStates(ctx, conn)
+	if err != nil {
+		_ = conn.Close(websocket.StatusInternalError, "post-subscribe refetch states")
+		return fmt.Errorf("post-subscribe refetch states: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "reconnect cancelled")
+		return err
+	}
+	if err := c.activate(conn, states); err != nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "shutdown")
+		return err
 	}
 	return nil
 }
@@ -293,18 +481,21 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 		if env.Event == nil {
 			continue
 		}
+		eid := env.Event.Data.EntityID
+		c.mu.Lock()
 		if ns := env.Event.Data.NewState; ns != nil {
-			eid := env.Event.Data.EntityID
-			now := time.Now()
-			c.mu.Lock()
 			c.states[eid] = EntityState{
 				EntityID:   eid,
 				State:      ns.State,
 				Attributes: ns.Attributes,
 			}
-			c.lastUpdate[eid] = now
-			c.mu.Unlock()
+			c.lastUpdate[eid] = time.Now()
+		} else {
+			delete(c.states, eid)
+			delete(c.lastUpdate, eid)
 		}
+		c.generation[eid]++
+		c.mu.Unlock()
 	}
 }
 
@@ -314,14 +505,46 @@ func (c *Client) currentConn() *websocket.Conn {
 	return c.conn
 }
 
-// writeJSON serializes a write against connMu so writers never overlap.
-func (c *Client) writeJSON(ctx context.Context, v any) error {
+func (c *Client) disconnectIfCurrent(conn *websocket.Conn, err error) bool {
 	c.connMu.Lock()
-	defer c.connMu.Unlock()
+	if c.conn != conn {
+		c.connMu.Unlock()
+		return false
+	}
+	c.conn = nil
+	c.connected.Store(false)
+	c.mu.Lock()
+	clear(c.lastUpdate)
+	c.mu.Unlock()
+	c.connMu.Unlock()
+	c.failPending(err)
+	if conn != nil {
+		_ = conn.Close(websocket.StatusInternalError, "connection lost")
+	}
+	return true
+}
+
+func (c *Client) writeJSONAllowConnecting(ctx context.Context, v any) error {
+	c.connMu.Lock()
 	if c.conn == nil {
+		c.connMu.Unlock()
 		return errors.New("ha: not connected")
 	}
-	return wsjson.Write(ctx, c.conn, v)
+	conn := c.conn
+	err := wsjson.Write(ctx, conn, v)
+	c.connMu.Unlock()
+	if err != nil {
+		c.disconnectIfCurrent(conn, err)
+	}
+	return err
+}
+
+// writeJSON serializes a write against connMu so writers never overlap.
+func (c *Client) writeJSON(ctx context.Context, v any) error {
+	if !c.connected.Load() {
+		return errors.New("ha: not connected")
+	}
+	return c.writeJSONAllowConnecting(ctx, v)
 }
 
 // State returns the current state string for an entity.
@@ -424,7 +647,7 @@ func (c *Client) deliverResult(id int64, success *bool, e *struct {
 	if !ok {
 		return // subscribe/get_states acks and other uncorrelated results
 	}
-	res := callResult{success: success == nil || *success}
+	res := callResult{success: success != nil && *success}
 	if e != nil {
 		res.errMsg = e.Message
 	}
@@ -449,6 +672,15 @@ func (c *Client) failPending(err error) {
 	}
 }
 
+// UpdateGeneration returns the number of state snapshots observed for an entity.
+// It is monotonic within this client process and changes even when Home Assistant's
+// timestamps are equal or ambiguous.
+func (c *Client) UpdateGeneration(entityID string) uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.generation[entityID]
+}
+
 // LastUpdate returns the last time the given entity's state refreshed, or the
 // zero time if it has never been seen.
 func (c *Client) LastUpdate(entityID string) time.Time {
@@ -467,14 +699,41 @@ func (c *Client) Fresh(entityID string, within time.Duration) bool {
 	return !t.IsZero() && time.Since(t) <= within
 }
 
-// Close closes the connection. Shutdown requires cancelling the context passed
-// to SubscribeEvents first: Close alone only drops the socket, which the
-// supervisor would treat as a lost connection and reconnect.
+// Close stops the supervisor before closing the connection. Call it after the
+// actuator's fail-safe so the subscribed connection remains available until its
+// final disable is confirmed.
 func (c *Client) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.superviseMu.Lock()
+	cancel := c.superviseCancel
+	c.superviseCancel = nil
+	c.superviseMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	c.setupMu.Lock()
+	staged := c.setup
+	c.setup = nil
+	c.setupMu.Unlock()
+	if staged != nil {
+		_ = staged.conn.Close(websocket.StatusNormalClosure, "shutdown")
+	}
+
+	c.superviseWG.Wait()
 	c.connMu.Lock()
-	defer c.connMu.Unlock()
-	if c.conn != nil {
-		return c.conn.Close(websocket.StatusNormalClosure, "shutdown")
+	conn := c.conn
+	c.conn = nil
+	c.connected.Store(false)
+	c.mu.Lock()
+	clear(c.lastUpdate)
+	c.mu.Unlock()
+	c.connMu.Unlock()
+	c.failPending(errors.New("ha: closed"))
+	if conn != nil {
+		return conn.Close(websocket.StatusNormalClosure, "shutdown")
 	}
 	return nil
 }

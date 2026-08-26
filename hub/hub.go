@@ -7,6 +7,7 @@ import (
 	"math"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"energy-optimiser/actuator"
@@ -45,6 +46,19 @@ const (
 )
 
 // Hub is the central coordinator that runs the 5-minute tick loop.
+type chargeActuator interface {
+	Start(context.Context) error
+	Close()
+	SetChargePlan(context.Context, actuator.ChargePlan) error
+	ChargingObserved() actuator.ChargeObservation
+}
+
+type chargeNotifier interface {
+	Lifecycle(context.Context, time.Time, alert.ChargeStatus) error
+	Forecast(context.Context, time.Time, *optimizer.Schedule) error
+	ResolveGridCharge(context.Context, time.Time) error
+}
+
 type Hub struct {
 	cfg         *config.Config
 	influx      *influx.Client // nil if unavailable
@@ -53,8 +67,8 @@ type Hub struct {
 	pvModel     *pvmodel.Model // nil if the persistent model could not be prepared
 	loadModel   *loadmodel.Model
 	ha          *ha.Client
-	actuator    *actuator.Actuator
-	notifier    *alert.Notifier
+	actuator    chargeActuator
+	notifier    chargeNotifier
 	decisionPub *serve.DecisionPublisher
 	server      *serve.Server
 	accuracy    *accuracyRecorder
@@ -97,6 +111,9 @@ type Hub struct {
 	// slow metrics lookup never overlaps itself across ticks.
 	accResolveMu      sync.Mutex
 	accResolveRunning bool
+
+	started atomic.Bool
+	closed  atomic.Bool
 }
 
 func New(cfg *config.Config, dryRun bool) (*Hub, error) {
@@ -182,13 +199,23 @@ func New(cfg *config.Config, dryRun bool) (*Hub, error) {
 }
 
 func (h *Hub) Close() {
+	if !h.closed.CompareAndSwap(false, true) {
+		return
+	}
 	if h.decisionPub != nil {
 		h.decisionPub.Close()
 	}
 	if h.actuator != nil {
 		h.actuator.Close()
 	}
-	_ = h.ha.Close()
+	if h.started.Load() && h.notifier != nil && h.actuator != nil {
+		if err := h.notifier.Lifecycle(context.Background(), time.Now().In(h.cfg.Location()), alert.ChargeStatus{State: observedAlertState(h.actuator.ChargingObserved())}); err != nil {
+			slog.Warn("grid-charge shutdown lifecycle delivery failed", "error", err)
+		}
+	}
+	if h.ha != nil {
+		_ = h.ha.Close()
+	}
 	if h.influx != nil {
 		_ = h.influx.Close()
 	}
@@ -203,12 +230,20 @@ func (h *Hub) Run(ctx context.Context) error {
 		return fmt.Errorf("ha subscribe: %w", err)
 	}
 
+	// Start the lifecycle heartbeat before actuator reconciliation, which may block
+	// on slow inverter read-back. This keeps an observed-on alert lease alive while
+	// startup is still proving the hardware safe.
+	stopStartupHeartbeat := h.startStartupLifecycle(ctx)
+	defer stopStartupHeartbeat()
+
 	// Reconcile the actuator against the live inverter state and start its
 	// write-owning goroutine + watchdog before the first tick. Non-fatal: a
 	// reconcile write error is logged; the watchdog will retry.
 	if err := h.actuator.Start(ctx); err != nil {
 		slog.Warn("actuator startup reconcile", "error", err)
 	}
+	h.started.Store(true)
+	h.deliverStartupLifecycle(ctx, h.actuator.ChargingObserved())
 
 	// Connect the decision publisher and announce its HA-discovery entities.
 	// Non-fatal: a broker outage shouldn't block the optimizer loop (paho
@@ -271,6 +306,7 @@ func (h *Hub) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	h.tick(ctx)
+	stopStartupHeartbeat()
 	for {
 		select {
 		case <-ctx.Done():
@@ -281,26 +317,93 @@ func (h *Hub) Run(ctx context.Context) error {
 	}
 }
 
+func (h *Hub) startStartupLifecycle(ctx context.Context) func() {
+	if h.notifier == nil || h.actuator == nil {
+		return func() {}
+	}
+	interval := h.cfg.Service.PollInterval.Duration
+	if interval <= 0 || interval >= 5*time.Minute {
+		interval = time.Minute
+	}
+	stop := make(chan struct{})
+	var once sync.Once
+	go func() {
+		h.deliverStartupLifecycle(ctx, h.actuator.ChargingObserved())
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				h.deliverStartupLifecycle(ctx, h.actuator.ChargingObserved())
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(stop) }) }
+}
+
+func (h *Hub) deliverStartupLifecycle(ctx context.Context, observed actuator.ChargeObservation) {
+	now := time.Now().In(h.cfg.Location())
+	var err error
+	if observed == actuator.ChargeOff {
+		err = h.notifier.ResolveGridCharge(ctx, now)
+	} else {
+		err = h.notifier.Lifecycle(ctx, now, alert.ChargeStatus{State: observedAlertState(observed)})
+	}
+	if err != nil {
+		slog.Warn("grid-charge startup lifecycle delivery failed; will retry", "error", err)
+	}
+}
+
+func observedAlertState(observed actuator.ChargeObservation) alert.ChargeState {
+	switch observed {
+	case actuator.ChargeOff:
+		return alert.ChargeOff
+	case actuator.ChargeOn:
+		return alert.ChargeOn
+	default:
+		return alert.ChargeUnknown
+	}
+}
+
+func (h *Hub) finalizeTickLifecycle(ctx context.Context, chargeContext *alert.ChargeContext) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("grid-charge lifecycle finalization panicked", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	if h.notifier == nil || h.actuator == nil {
+		return
+	}
+	if err := h.notifier.Lifecycle(ctx, time.Now().In(h.cfg.Location()), alert.ChargeStatus{
+		State:   observedAlertState(h.actuator.ChargingObserved()),
+		Context: chargeContext,
+	}); err != nil {
+		slog.Warn("grid-charge lifecycle refresh failed", "error", err)
+	}
+}
+
 func (h *Hub) tick(ctx context.Context) {
-	// Defense in depth: a single bad tick (e.g. a config-driven BuildGrid
-	// invariant panic) must never kill the daemon — recover, log with the stack,
-	// and skip this tick so the next one runs.
+	var chargeContext *alert.ChargeContext
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("tick panicked — skipping this tick", "panic", r, "stack", string(debug.Stack()))
 		}
+		h.finalizeTickLifecycle(ctx, chargeContext)
 	}()
 
-	// Floor to the slot boundary so solar/load vectors, tariff windows, and the
-	// schedule grid all align (PrepareInput floors too; keep them consistent).
-	now := time.Now().In(h.cfg.Location()).Truncate(h.cfg.Service.SlotDuration.Duration)
-	slog.Info("tick", "time", now.Format(time.TimeOnly), "actuator_mode", h.mode)
+	// Floor only the optimiser decision clock; alerts use real wall time.
+	decisionNow := time.Now().In(h.cfg.Location()).Truncate(h.cfg.Service.SlotDuration.Duration)
+	slog.Info("tick", "time", decisionNow.Format(time.TimeOnly), "actuator_mode", h.mode)
 
 	if h.cfg.Solcast.APIKey != "" {
-		h.maybeRefreshSolar(ctx, now)
+		h.maybeRefreshSolar(ctx, decisionNow)
 	}
-	h.maybeRefreshWeather(ctx, now)
-	h.maybeRetrainLoadModel(ctx, now)
+	h.maybeRefreshWeather(ctx, decisionNow)
+	h.maybeRetrainLoadModel(ctx, decisionNow)
 
 	currentSOC := h.ha.StateFloat(h.cfg.HomeAssistant.Entities.BatterySOC) / 100.0
 	socKnown := currentSOC > 0
@@ -313,14 +416,14 @@ func (h *Hub) tick(ctx context.Context) {
 
 	// Build the telescoping slot grid once and thread it through the forecast and
 	// load vectors; PrepareInput rebuilds the same deterministic grid internally.
-	grid := optimizer.BuildGrid(now, h.cfg)
+	grid := optimizer.BuildGrid(decisionNow, h.cfg)
 
-	solarKW := h.solarForecastSlots(grid, now)
+	solarKW := h.solarForecastSlots(grid, decisionNow)
 	// currentLoadModel (not h.loadModel directly): the retrain swaps the pointer
 	// from a background goroutine, so even the tick's own read must take the lock.
 	loadW := h.currentLoadModel().Predict(grid.Start)
 
-	input := optimizer.PrepareInput(now, h.cfg, solarKW, loadW, currentSOC)
+	input := optimizer.PrepareInput(decisionNow, h.cfg, solarKW, loadW, currentSOC)
 	sched, err := optimizer.Solve(input)
 	if err != nil {
 		slog.Error("optimizer failed", "error", err)
@@ -330,19 +433,23 @@ func (h *Hub) tick(ctx context.Context) {
 	h.schedule = sched
 	h.mu.Unlock()
 
-	slot := sched.CurrentSlot(now)
+	slot := sched.CurrentSlot(decisionNow)
 	if slot != nil {
-		plan := h.buildChargePlan(now, sched, slot, currentSOC, socKnown)
+		plan := h.buildChargePlan(decisionNow, sched, slot, currentSOC, socKnown)
+		if plan.Charging {
+			chargeContext = &alert.ChargeContext{InitialSOC: currentSOC, TargetSOC: plan.TargetSOC}
+		}
 		if err := h.actuator.SetChargePlan(ctx, plan); err != nil {
 			slog.Error("actuator set charge plan", "error", err)
 		}
 	}
-	// Advisory decision/risk notifications run in every mode (they never actuate).
-	h.notifier.Evaluate(ctx, now, sched, currentSOC)
+	if err := h.notifier.Forecast(ctx, decisionNow, sched); err != nil {
+		slog.Warn("forecast alertmanager post failed", "error", err)
+	}
 
-	h.recordDecision(ctx, now, slot)
-	h.publishDecision(now, slot, sched, currentSOC)
-	h.recordAccuracy(ctx, now, slot, currentSOC, socKnown)
+	h.recordDecision(ctx, decisionNow, slot)
+	h.publishDecision(decisionNow, slot, sched, currentSOC)
+	h.recordAccuracy(ctx, decisionNow, slot, currentSOC, socKnown)
 
 	var flowKW, importKW float64
 	if slot != nil {

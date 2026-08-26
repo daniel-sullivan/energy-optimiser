@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"energy-optimiser/config"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- test doubles ---
@@ -28,13 +31,14 @@ type recordedCall struct {
 // cache, so the actuator's read-back confirmation passes. It never touches real
 // hardware.
 type fakeHA struct {
-	mu      sync.Mutex
-	states  map[string]string
-	attrs   map[string]map[string]any
-	fresh   map[string]bool // per-entity; absent ⇒ freshOK
-	freshOK bool            // default when entity absent from `fresh`
-	ackErr  error           // if set, CallServiceAck returns it (no reflect)
-	calls   []recordedCall
+	mu         sync.Mutex
+	states     map[string]string
+	attrs      map[string]map[string]any
+	generation map[string]uint64
+	fresh      map[string]bool // per-entity; absent ⇒ freshOK
+	freshOK    bool            // default when entity absent from `fresh`
+	ackErr     error           // if set, CallServiceAck returns it (no reflect)
+	calls      []recordedCall
 
 	// dropOnce[entity] = N: the next N writes to that entity are acked but NOT
 	// reflected into the state cache — modelling the SRNE dropping a rapid-fire
@@ -48,11 +52,12 @@ type fakeHA struct {
 
 func newFakeHA() *fakeHA {
 	return &fakeHA{
-		states:   map[string]string{},
-		attrs:    map[string]map[string]any{},
-		fresh:    map[string]bool{},
-		freshOK:  true,
-		dropOnce: map[string]int{},
+		states:     map[string]string{},
+		attrs:      map[string]map[string]any{},
+		generation: map[string]uint64{},
+		fresh:      map[string]bool{},
+		freshOK:    true,
+		dropOnce:   map[string]int{},
 	}
 }
 
@@ -86,6 +91,8 @@ func (f *fakeHA) CallServiceAck(_ context.Context, domain, service string, data 
 			f.states[entity] = v
 		}
 	}
+	f.generation[entity]++
+	f.fresh[entity] = true
 	return nil
 }
 
@@ -106,6 +113,12 @@ func (f *fakeHA) Attributes(entityID string) map[string]any {
 	return f.attrs[entityID]
 }
 
+func (f *fakeHA) UpdateGeneration(entityID string) uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.generation[entityID]
+}
+
 func (f *fakeHA) Fresh(entityID string, _ time.Duration) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -119,6 +132,7 @@ func (f *fakeHA) setState(entityID, state string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.states[entityID] = state
+	f.generation[entityID]++
 }
 
 // --- recorded-call queries ---
@@ -232,6 +246,7 @@ const (
 )
 
 func testCfg(t *testing.T) config.ActuatorHW {
+	t.Helper()
 	return config.ActuatorHW{
 		TimedChargeSwitch:        switchEntity,
 		MainsChargeCurrentNumber: ampsEntity,
@@ -252,16 +267,17 @@ func testCfg(t *testing.T) config.ActuatorHW {
 	}
 }
 
-// seedWindows pre-populates the charge-window text entities with the mirrored,
-// INSET off-peak values (01:00-05:00 → 01:05-04:55, 11:00-13:00 → 11:05-12:55),
-// modelling the steady state after the rail has been established — so reconcile's
-// idempotent mirror is a no-op and tests observe a clean write count. Slot 3 has
-// no configured off-peak window, so it stays empty.
-func seedWindows(f *fakeHA) {
+// seedSafeState pre-populates every hardware rail slot and the current entity
+// with the fail-closed steady state. Slots 1 and 2 mirror inset off-peak windows;
+// surplus slot 3 is explicitly disabled with equal non-midnight bounds.
+func seedSafeState(f *fakeHA) {
+	f.setState(ampsEntity, "0")
 	f.setState(w1s, "01:05")
 	f.setState(w1e, "04:55")
 	f.setState(w2s, "11:05")
 	f.setState(w2e, "12:55")
+	f.setState(w3s, disabledWindow)
+	f.setState(w3e, disabledWindow)
 }
 
 // inWindow is 02:00 Tokyo (inside 01:00-05:00); outWindow is 08:00 (peak);
@@ -296,7 +312,7 @@ func startWith(t *testing.T, fake *fakeHA, mode Mode, now time.Time) (*Actuator,
 func newActuator(t *testing.T, mode Mode, now time.Time, initialSwitch string) (*Actuator, *fakeHA, *fakeClock) {
 	t.Helper()
 	fake := newFakeHA()
-	seedWindows(fake)
+	seedSafeState(fake)
 	if initialSwitch != "" {
 		fake.setState(switchEntity, initialSwitch)
 	}
@@ -312,6 +328,7 @@ func rawActuator(t *testing.T, fake *fakeHA, rates *config.Rates, cfg config.Act
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.now = func() time.Time { return inWindow }
 	fastSettle(a)
 	return a
 }
@@ -345,10 +362,9 @@ func submitSync(t *testing.T, a *Actuator, c command) {
 
 // --- the static off-peak window rail ---
 
-// TestReconcileMirrorsOffPeakWindows proves reconcile programs each charge-window
-// slot to STATICALLY mirror the configured off-peak period INSET by WindowInset
-// (5m: 01:00-05:00 → 01:05-04:55, 11:00-13:00 → 11:05-12:55), leaves a slot with
-// no corresponding window UNTOUCHED (never zeroed), and retries a dropped write.
+// TestReconcileMirrorsOffPeakWindows proves reconcile mirrors configured inset
+// off-peak periods, explicitly disables every surplus slot, and retries a dropped
+// write before reporting the rail safe.
 func TestReconcileMirrorsOffPeakWindows(t *testing.T) {
 	fake := newFakeHA()
 	fake.setState(switchEntity, switchOff)
@@ -364,9 +380,8 @@ func TestReconcileMirrorsOffPeakWindows(t *testing.T) {
 	if fake.State(w2s) != "11:05" || fake.State(w2e) != "12:55" {
 		t.Fatalf("slot 2 must mirror inset 11:05-12:55, got %q-%q", fake.State(w2s), fake.State(w2e))
 	}
-	// Slot 3 has no configured off-peak window → left untouched (never zeroed).
-	if fake.State(w3s) != "" || fake.State(w3e) != "" {
-		t.Fatalf("slot 3 must be left untouched, got %q-%q", fake.State(w3s), fake.State(w3e))
+	if fake.State(w3s) != disabledWindow || fake.State(w3e) != disabledWindow {
+		t.Fatalf("surplus slot 3 must be disabled, got %q-%q", fake.State(w3s), fake.State(w3e))
 	}
 	if fake.countSet(w1s) < 2 {
 		t.Fatalf("dropped window write must be retried (>=2 writes), got %d", fake.countSet(w1s))
@@ -387,6 +402,49 @@ func TestSteadyStateStartupNoWrites(t *testing.T) {
 // TestStartSetsCurrentEnablesLast proves a fresh charge sets the per-unit current
 // and enables timed charge LAST (after the current), and does NOT rewrite the
 // static window rail.
+func TestSurplusSlotDisabledBeforeEnable(t *testing.T) {
+	fake := newFakeHA()
+	fake.setState(ampsEntity, "0")
+	fake.setState(switchEntity, switchOff)
+	fake.setState(w1s, "01:05")
+	fake.setState(w1e, "04:55")
+	fake.setState(w2s, "11:05")
+	fake.setState(w2e, "12:55")
+	a, _ := startWith(t, fake, ModeLive, inWindow)
+	before := fake.totalCalls()
+
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+
+	enableIdx := fake.lastIndexOf(isSwitch("turn_on"))
+	for _, entity := range []string{w3s, w3e} {
+		idx := fake.lastIndexOf(func(c recordedCall) bool {
+			return c.service == "set_value" && c.entity == entity && c.value == disabledWindow
+		})
+		if idx < 0 || idx >= enableIdx || idx >= before {
+			assert.Failf(t, "assertion failed", "surplus rail %s must be disabled during reconcile before enable; index=%d enable=%d startup calls=%d", entity, idx, enableIdx, before)
+		}
+	}
+}
+
+func TestUnsafeRailBlocksTurnOn(t *testing.T) {
+	fake := newFakeHA()
+	seedSafeState(fake)
+	fake.setState(switchEntity, switchOff)
+	fake.setState(w1s, "09:00")
+	fake.mu.Lock()
+	fake.dropOnce[w1s] = 1000
+	fake.mu.Unlock()
+	a := rawActuator(t, fake, testRates(t), testCfg(t))
+	a.now = func() time.Time { return inWindow }
+
+	if err := a.handlePlan(ChargePlan{Charging: true, GridKW: 5}); err == nil {
+		assert.Fail(t, "an unconfirmed unsafe rail repair must return an error")
+	}
+	if fake.countService("turn_on") != 0 || fake.State(switchEntity) != switchOff {
+		assert.Fail(t, "an unsafe rail must block timed-charge enablement")
+	}
+}
+
 func TestStartSetsCurrentEnablesLast(t *testing.T) {
 	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
 
@@ -411,8 +469,8 @@ func TestStartSetsCurrentEnablesLast(t *testing.T) {
 			t.Fatalf("start must not rewrite the static window rail; %s written %d times", e, fake.countSet(e))
 		}
 	}
-	if !a.st.charging {
-		t.Fatal("state must record charging after a confirmed enable")
+	if !a.st.charging || a.ChargingObserved() != ChargeOn {
+		t.Fatal("confirmed enable must report charging")
 	}
 }
 
@@ -494,8 +552,8 @@ func TestStopDisablesFirstThenZerosCurrent(t *testing.T) {
 			t.Fatalf("stop must NEVER touch the windows; %s written", e)
 		}
 	}
-	if a.st.charging {
-		t.Fatal("stop must clear the charging state")
+	if a.st.charging || a.ChargingObserved() == ChargeOn {
+		t.Fatal("confirmed stop must clear the charging state")
 	}
 }
 
@@ -511,8 +569,42 @@ func TestStopWhenIdleIsNoOp(t *testing.T) {
 
 // --- write spacing + retry-until-confirmed ---
 
-// TestDroppedCurrentAndSwitchRetried proves a dropped current / enable write is
-// retried (spaced) within the same command and lands.
+// TestFreshPreWriteTargetSkipsIdempotentWrite proves a fresh cache already at
+// the target avoids an unnecessary service call rather than treating a later ACK
+// as causal proof that a potentially dropped write landed.
+func TestFreshPreWriteTargetSkipsIdempotentWrite(t *testing.T) {
+	fake := newFakeHA()
+	fake.setState(switchEntity, switchOff)
+	fake.setState(ampsEntity, "10")
+	a := rawActuator(t, fake, testRates(t), testCfg(t))
+
+	require.NoError(t, a.setCurrent(10), "fresh idempotent target must succeed without a write")
+	if got := fake.countSet(ampsEntity); got != 0 {
+		assert.Failf(t, "assertion failed", "fresh idempotent target must skip the service call, got %d writes", got)
+	}
+}
+
+// TestStalePreWriteTargetCannotConfirmWrite proves a matching but stale cache
+// never confirms an acknowledged write: a new matching state generation remains
+// required when the pre-attempt observation is not fresh.
+func TestStalePreWriteTargetCannotConfirmWrite(t *testing.T) {
+	fake := newFakeHA()
+	fake.setState(switchEntity, switchOff)
+	fake.setState(ampsEntity, "10")
+	fake.mu.Lock()
+	fake.fresh[ampsEntity] = false
+	fake.dropOnce[ampsEntity] = 1000
+	fake.mu.Unlock()
+	a := rawActuator(t, fake, testRates(t), testCfg(t))
+
+	if err := a.setCurrent(10); err == nil {
+		assert.Fail(t, "a matching stale cache must not confirm a write")
+	}
+	if got := fake.countSet(ampsEntity); got != maxWriteRetries+1 {
+		assert.Failf(t, "assertion failed", "stale cached target must exhaust retries, got %d writes", got)
+	}
+}
+
 func TestDroppedCurrentAndSwitchRetried(t *testing.T) {
 	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
 	fake.mu.Lock()
@@ -549,12 +641,29 @@ func TestUnconfirmedEnableLeavesNotCharging(t *testing.T) {
 	if err := a.SetChargePlan(ctx, ChargePlan{Charging: true, GridKW: 5}); err == nil {
 		t.Fatal("an unconfirmed enable must surface an error")
 	}
-	if a.st.charging {
-		t.Fatal("unconfirmed enable must not record charging (so the next tick retries)")
+	if a.st.charging || a.ChargingObserved() == ChargeOn {
+		t.Fatal("unconfirmed enable must not report charging (so the next tick retries)")
 	}
 	// Current was still set (safe — switch is off, nothing charges).
 	if v := fake.StateFloat(ampsEntity); v <= 0 {
 		t.Fatal("current must still be set even when the enable fails")
+	}
+}
+
+func TestUnconfirmedDisableRetainsConfirmedState(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+	fake.mu.Lock()
+	fake.dropOnce[switchEntity] = 1000
+	fake.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.SetChargePlan(ctx, ChargePlan{}); err == nil {
+		assert.Fail(t, "an unconfirmed disable must surface an error")
+	}
+	if a.ChargingObserved() != ChargeOn {
+		assert.Fail(t, "unconfirmed disable must retain confirmed state until timed charge is confirmed off")
 	}
 }
 
@@ -629,30 +738,70 @@ func TestWatchdogQuietWhenOffOutsideWindow(t *testing.T) {
 	}
 }
 
-func TestWatchdogQuietInWindow(t *testing.T) {
+func TestWatchdogLeavesActiveInWindowChargeUntouched(t *testing.T) {
 	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
-	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5}) // legitimately charging in-window
+	mustPlan(t, a, ChargePlan{
+		Charging:   true,
+		GridKW:     5,
+		CurrentSOC: 0.4,
+		TargetSOC:  0.7,
+		BlockEnd:   blockEnd(4, 55),
+	})
 	before := fake.totalCalls()
-
-	submitSync(t, a, command{kind: cmdWatchdog}) // in-window: policy governs, watchdog stays quiet
-	if got := fake.totalCalls(); got != before {
-		t.Fatalf("watchdog must not act in-window; writes %d→%d", before, got)
-	}
-	if fake.State(switchEntity) != switchOn {
-		t.Fatal("watchdog must not disable a legitimate in-window charge")
-	}
-}
-
-// TestWatchdogReassertsWindowMirror proves the watchdog idempotently re-asserts
-// the static window rail, self-healing a mid-life window scramble.
-func TestWatchdogReassertsWindowMirror(t *testing.T) {
-	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
-	fake.setState(w1s, "09:00") // a mid-life window corruption
+	commit := a.commit
+	state := a.st
 
 	submitSync(t, a, command{kind: cmdWatchdog})
 
-	if got := fake.State(w1s); got != "01:05" {
-		t.Fatalf("watchdog must re-assert the mirrored window; w1s=%q want 01:05", got)
+	if got := fake.totalCalls(); got != before {
+		assert.Failf(t, "assertion failed", "in-window watchdog must issue no switch, current, or window writes; writes %d→%d", before, got)
+	}
+	if a.commit != commit {
+		assert.Failf(t, "assertion failed", "in-window watchdog must preserve charge commitment: got %+v want %+v", a.commit, commit)
+	}
+	if a.st != state || fake.State(switchEntity) != switchOn {
+		assert.Failf(t, "assertion failed", "in-window watchdog must preserve active charge state: got %+v switch=%q want %+v/on", a.st, fake.State(switchEntity), state)
+	}
+}
+
+func TestWatchdogSafesUnownedChargeInsideWindow(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.setState(switchEntity, switchOn)
+	fake.setState(ampsEntity, "20")
+
+	submitSync(t, a, command{kind: cmdWatchdog})
+
+	if fake.State(switchEntity) != switchOff || fake.StateFloat(ampsEntity) != 0 || a.st != (chargeState{}) {
+		assert.Failf(t, "assertion failed", "in-window watchdog must safe an unowned charge: state=%+v switch=%q current=%v", a.st, fake.State(switchEntity), fake.StateFloat(ampsEntity))
+	}
+}
+
+func TestWatchdogSafesUnknownChargeInsideWindow(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.mu.Lock()
+	fake.states[switchEntity] = "unknown"
+	fake.fresh[switchEntity] = false
+	fake.mu.Unlock()
+
+	submitSync(t, a, command{kind: cmdWatchdog})
+
+	if fake.State(switchEntity) != switchOff || fake.StateFloat(ampsEntity) != 0 {
+		assert.Failf(t, "assertion failed", "in-window watchdog must fail closed when ownership cannot be confirmed: switch=%q current=%v", fake.State(switchEntity), fake.StateFloat(ampsEntity))
+	}
+}
+
+func TestWatchdogDoesNotRepairRailInsideWindow(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.setState(w1s, "09:00")
+	before := fake.totalCalls()
+
+	submitSync(t, a, command{kind: cmdWatchdog})
+
+	if got := fake.totalCalls(); got != before {
+		assert.Failf(t, "assertion failed", "in-window watchdog must not write while policy may own an active charge; writes %d→%d", before, got)
+	}
+	if got := fake.State(w1s); got != "09:00" {
+		assert.Failf(t, "assertion failed", "in-window watchdog must leave rail repair to the policy path, got %q", got)
 	}
 }
 
@@ -663,6 +812,9 @@ func TestCloseDisablesTimedCharge(t *testing.T) {
 	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5}) // charging
 
 	a.Close()
+	if a.ChargingObserved() == ChargeOn {
+		t.Fatal("Close must clear confirmed charging after the disable")
+	}
 	if fake.State(switchEntity) != switchOff {
 		t.Fatal("Close must disable timed charge")
 	}
@@ -675,9 +827,12 @@ func TestCloseDisablesTimedCharge(t *testing.T) {
 
 func TestReconcileDisablesTimedChargeFoundOn(t *testing.T) {
 	// Switch found ON at startup (a crashed-daemon leftover) → reconcile disables.
-	_, fake, _ := newActuator(t, ModeLive, inWindow, switchOn)
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOn)
 	if fake.State(switchEntity) != switchOff {
 		t.Fatal("startup reconcile must disable a timed charge found enabled")
+	}
+	if a.ChargingObserved() == ChargeOn {
+		t.Fatal("confirmed charge state must clear after startup disable confirms")
 	}
 	if got := fake.countService("turn_off"); got < 1 {
 		t.Fatalf("reconcile must issue a disable when found on, got %d turn_off", got)
@@ -685,9 +840,84 @@ func TestReconcileDisablesTimedChargeFoundOn(t *testing.T) {
 }
 
 func TestReconcileObserveModeDoesNotWrite(t *testing.T) {
-	_, fake, _ := newActuator(t, ModeObserve, inWindow, switchOn)
+	a, fake, _ := newActuator(t, ModeObserve, inWindow, switchOn)
 	if got := fake.totalCalls(); got != 0 {
 		t.Fatalf("observe-mode reconcile must not write even if found on, got %d", got)
+	}
+	if a.ChargingObserved() != ChargeOn {
+		t.Fatal("observe mode must report the fresh observed-on state")
+	}
+}
+
+func TestReconcileUnknownStartupSafesInLiveButRemainsUnknownInObserve(t *testing.T) {
+	liveFake := newFakeHA()
+	seedSafeState(liveFake)
+	liveFake.setState(switchEntity, "unavailable")
+	liveFake.mu.Lock()
+	liveFake.fresh[switchEntity] = false
+	liveFake.mu.Unlock()
+	live, _ := startWith(t, liveFake, ModeLive, inWindow)
+	if liveFake.countService("turn_off") == 0 || live.ChargingObserved() != ChargeOff {
+		assert.Fail(t, "live startup must safe unknown state and require fresh observed off")
+	}
+
+	observeFake := newFakeHA()
+	seedSafeState(observeFake)
+	observeFake.setState(switchEntity, "unavailable")
+	observeFake.mu.Lock()
+	observeFake.fresh[switchEntity] = false
+	observeFake.mu.Unlock()
+	observe, _ := startWith(t, observeFake, ModeObserve, inWindow)
+	if observeFake.totalCalls() != 0 || observe.ChargingObserved() != ChargeUnknown {
+		assert.Fail(t, "observe startup cannot safe and must preserve unknown")
+	}
+}
+
+func TestExternalOffCancelsCommitmentAndZerosCurrent(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	plan := ChargePlan{Charging: true, GridKW: 5, CurrentSOC: 0.4, TargetSOC: 0.7, BlockEnd: blockEnd(4, 55)}
+	mustPlan(t, a, plan)
+	if !a.commit.active || fake.StateFloat(ampsEntity) == 0 {
+		assert.Fail(t, "precondition: committed charge with nonzero current")
+	}
+
+	fake.setState(switchEntity, switchOff)
+	onBefore := fake.countService("turn_on")
+	mustPlan(t, a, plan)
+	if a.commit.active {
+		assert.Fail(t, "fresh external off must cancel the stale commitment")
+	}
+	if fake.State(switchEntity) != switchOff || fake.StateFloat(ampsEntity) != 0 {
+		assert.Fail(t, "external off safety stop must keep the switch off and zero current")
+	}
+	if fake.countService("turn_on") != onBefore {
+		assert.Fail(t, "external off must not auto-reenable from the stale commitment")
+	}
+}
+
+func TestExternalOnWithOffPlanDisables(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.setState(switchEntity, switchOn)
+	fake.setState(ampsEntity, "20")
+	beforeOff := fake.countService("turn_off")
+	mustPlan(t, a, ChargePlan{})
+	if fake.countService("turn_off") <= beforeOff || a.ChargingObserved() != ChargeOff {
+		assert.Fail(t, "fresh observed external on with an off plan must disable")
+	}
+	if fake.StateFloat(ampsEntity) != 0 {
+		assert.Fail(t, "external-on stop must zero current")
+	}
+}
+
+func TestStopObservedOffStillZerosNonzeroCurrent(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	fake.setState(ampsEntity, "12")
+	mustPlan(t, a, ChargePlan{})
+	if fake.StateFloat(ampsEntity) != 0 || fake.countSet(ampsEntity) == 0 {
+		assert.Fail(t, "an observed-off stop must still zero residual nonzero current")
+	}
+	if fake.countService("turn_off") != 0 {
+		assert.Fail(t, "an already-observed-off stop need not rewrite the switch")
 	}
 }
 
@@ -811,9 +1041,9 @@ func TestInsetWindow(t *testing.T) {
 	}
 }
 
-// TestMirrorSkipsShortWindow proves an off-peak window shorter than 2×inset is
-// skipped (not written) rather than programmed with a collapsed/inverted window.
-func TestMirrorSkipsShortWindow(t *testing.T) {
+// TestShortWindowFailsClosed proves an unrepresentable off-peak interval returns
+// an error and cannot lead to timed-charge enablement.
+func TestShortWindowFailsClosed(t *testing.T) {
 	const shortTOML = `
 time_zone = "Asia/Tokyo"
 [rates]
@@ -825,22 +1055,21 @@ start = "02:00"
 end = "02:08"
 `
 	fake := newFakeHA()
+	seedSafeState(fake)
+	fake.setState(switchEntity, switchOff)
 	a := rawActuator(t, fake, parseRates(t, shortTOML), testCfg(t))
-	wrote, err := a.ensureWindowsMirrorOffPeak()
-	if err != nil {
-		t.Fatalf("mirror should not error, got %v", err)
+	a.now = func() time.Time { return time.Date(2026, 1, 15, 2, 4, 0, 0, tokyo) }
+	if err := a.handlePlan(ChargePlan{Charging: true, GridKW: 5}); err == nil {
+		assert.Fail(t, "an unrepresentable short window must fail closed")
 	}
-	if wrote {
-		t.Fatal("a sub-2×inset window must be skipped (no write)")
-	}
-	if fake.State(w1s) != "" || fake.State(w1e) != "" {
-		t.Fatalf("short window slot must be left untouched, got %q-%q", fake.State(w1s), fake.State(w1e))
+	if fake.countService("turn_on") != 0 || fake.State(switchEntity) != switchOff {
+		assert.Fail(t, "an unsafe short window must prevent timed-charge enablement")
 	}
 }
 
-// TestMirrorSkipsMidnightBound proves a mirrored window whose inset bound lands on
-// 00:00 (which the inverter may misread as a wrap/zero window) is skipped.
-func TestMirrorSkipsMidnightBound(t *testing.T) {
+// TestMidnightBoundFailsClosed proves a mirrored 00:00 bound returns an error and
+// cannot lead to timed-charge enablement.
+func TestMidnightBoundFailsClosed(t *testing.T) {
 	// 23:55-04:00 inset by 5m → start 00:00 (midnight) → must skip.
 	const midnightTOML = `
 time_zone = "Asia/Tokyo"
@@ -853,16 +1082,15 @@ start = "23:55"
 end = "04:00"
 `
 	fake := newFakeHA()
+	seedSafeState(fake)
+	fake.setState(switchEntity, switchOff)
 	a := rawActuator(t, fake, parseRates(t, midnightTOML), testCfg(t))
-	wrote, err := a.ensureWindowsMirrorOffPeak()
-	if err != nil {
-		t.Fatalf("mirror should not error, got %v", err)
+	a.now = func() time.Time { return time.Date(2026, 1, 15, 1, 0, 0, 0, tokyo) }
+	if err := a.handlePlan(ChargePlan{Charging: true, GridKW: 5}); err == nil {
+		assert.Fail(t, "a midnight-bound window must fail closed")
 	}
-	if wrote {
-		t.Fatal("a window with a 00:00 mirrored bound must be skipped (no write)")
-	}
-	if fake.State(w1s) != "" || fake.State(w1e) != "" {
-		t.Fatalf("midnight-bound slot must be left untouched, got %q-%q", fake.State(w1s), fake.State(w1e))
+	if fake.countService("turn_on") != 0 || fake.State(switchEntity) != switchOff {
+		assert.Fail(t, "a midnight-bound window must prevent timed-charge enablement")
 	}
 }
 
@@ -907,6 +1135,51 @@ func TestPanicInTransitionRecoveredAndSafes(t *testing.T) {
 	submitSync(t, a, command{kind: cmdWatchdog})
 }
 
+func TestPanicInStartupReconcileRecoveredAndSafes(t *testing.T) {
+	fake := newFakeHA()
+	seedSafeState(fake)
+	fake.setState(switchEntity, switchOn)
+	fake.mu.Lock()
+	fake.panicNextCall = true
+	fake.mu.Unlock()
+	a, err := New(testCfg(t), testRates(t), fake, ModeLive)
+	require.NoError(t, err)
+	a.now = func() time.Time { return inWindow }
+	fastSettle(a)
+	if err := a.Start(context.Background()); err == nil {
+		assert.Fail(t, "a recovered startup reconcile panic must surface as an error")
+	}
+	t.Cleanup(a.Close)
+	if fake.State(switchEntity) != switchOff {
+		assert.Failf(t, "assertion failed", "startup panic recovery must best-effort disable timed charge; got %q", fake.State(switchEntity))
+	}
+}
+
+func TestPanicInShutdownSafingIsContained(t *testing.T) {
+	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
+	mustPlan(t, a, ChargePlan{Charging: true, GridKW: 5})
+	fake.mu.Lock()
+	fake.panicNextCall = true
+	fake.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		a.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		assert.Fail(t, "a panic during shutdown safing must be contained so Close returns")
+	}
+	if a.st != (chargeState{}) || a.commit != (chargeCommitment{}) {
+		assert.Failf(t, "assertion failed", "shutdown panic recovery must clear in-memory charge intent: state=%+v commitment=%+v", a.st, a.commit)
+	}
+	if fake.State(switchEntity) != switchOff || fake.StateFloat(ampsEntity) != 0 {
+		assert.Failf(t, "assertion failed", "shutdown panic recovery must retry the physical safe state; switch=%q current=%v", fake.State(switchEntity), fake.StateFloat(ampsEntity))
+	}
+}
+
 // --- persistence ---
 
 // TestPersistAtomicAndCorruptColdStart verifies (a) a corrupt persisted file
@@ -922,7 +1195,7 @@ func TestPersistAtomicAndCorruptColdStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := newFakeHA()
-	seedWindows(fake)
+	seedSafeState(fake)
 	fake.setState(switchEntity, switchOff)
 	a, err := New(cfg, testRates(t), fake, ModeLive)
 	if err != nil {
@@ -1012,8 +1285,8 @@ func TestCommitmentRidesOutSolverFlapping(t *testing.T) {
 	if got := fake.countService("turn_on"); got != 1 {
 		t.Errorf("commitment must keep one contiguous charge: got %d turn_on, want 1", got)
 	}
-	if !a.st.charging {
-		t.Error("must still be charging through the flapping")
+	if !a.st.charging || a.ChargingObserved() != ChargeOn {
+		t.Error("confirmed physical state must remain charging through solver flapping")
 	}
 }
 
@@ -1165,8 +1438,11 @@ func TestWatchdogClearsActiveCommitment(t *testing.T) {
 	if a.commit.active {
 		t.Error("watchdog must clear the commitment")
 	}
-	if a.st.charging || fake.State(switchEntity) != switchOff {
-		t.Error("watchdog must disable timed charge out of window")
+	if a.st != (chargeState{}) || a.ChargingObserved() == ChargeOn || fake.State(switchEntity) != switchOff || fake.StateFloat(ampsEntity) != 0 {
+		t.Errorf("watchdog must clear charge state, disable timed charge, and zero current out of window: state=%+v switch=%q current=%v", a.st, fake.State(switchEntity), fake.StateFloat(ampsEntity))
+	}
+	if fake.countService("turn_off") != 1 || fake.countSet(ampsEntity) != 2 {
+		t.Errorf("outside-window watchdog must force both safe writes after the initial current set: turn_off=%d current_writes=%d", fake.countService("turn_off"), fake.countSet(ampsEntity))
 	}
 	// And a stale committed-looking plan must not re-start it.
 	onBefore := fake.countService("turn_on")

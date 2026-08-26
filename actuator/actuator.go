@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 
@@ -65,15 +66,20 @@ type haClient interface {
 	State(entityID string) string
 	StateFloat(entityID string) float64
 	Attributes(entityID string) map[string]any
+	UpdateGeneration(entityID string) uint64
 	Fresh(entityID string, within time.Duration) bool
 }
 
-// ChargePlan is the policy's desired grid-charge state for the current tick. The
-// hub decides WHETHER to charge (SOC known, optimiser permits, and now is inside
-// an off-peak window) and the GRID SHARE in kW; the actuator owns the kW→A
-// conversion, the timed-charge window/current/enable sequencing, and the
-// off-peak hardware rail. The actuator re-derives the active off-peak window from
-// its own tariff config, so a window is never taken on trust from the caller.
+// ChargeObservation is the fresh observed state of Home Assistant's timed-charge
+// switch. Unknown means the entity is missing, unavailable, or stale.
+type ChargeObservation int32
+
+const (
+	ChargeUnknown ChargeObservation = iota
+	ChargeOff
+	ChargeOn
+)
+
 // ChargePlan is the policy's desired grid-charge state for the current tick, plus
 // the context the actuator needs to COMMIT to a contiguous charge block and ride
 // out the solver's per-tick hunting (see chargeCommitment). Charging/GridKW are
@@ -240,6 +246,34 @@ func (a *Actuator) SetChargePlan(ctx context.Context, plan ChargePlan) error {
 	return a.submit(ctx, command{kind: cmdPlan, plan: plan})
 }
 
+// ChargingObserved reports the current fresh observed timed-charge switch state.
+func (a *Actuator) ChargingObserved() ChargeObservation {
+	return a.observeCharging()
+}
+
+func (a *Actuator) observeCharging() ChargeObservation {
+	state := a.ha.State(a.cfg.TimedChargeSwitch)
+	if !a.ha.Fresh(a.cfg.TimedChargeSwitch, a.cfg.StateStale.Duration) {
+		return ChargeUnknown
+	}
+	switch state {
+	case switchOff:
+		return ChargeOff
+	case switchOn:
+		return ChargeOn
+	default:
+		return ChargeUnknown
+	}
+}
+
+func (a *Actuator) syncObservedCharging() ChargeObservation {
+	observed := a.observeCharging()
+	if observed == ChargeOff {
+		a.st.charging = false
+	}
+	return observed
+}
+
 // Close disables timed charge (the guaranteed-safe state) then stops all
 // goroutines. Idempotent. The fail-safe is run DETERMINISTICALLY by the loop
 // itself (shutdownSafe), not submitted as a racing cmdSafe: closing a.closed makes
@@ -317,6 +351,23 @@ func (a *Actuator) loop() {
 // a no-op when already stopped, and a no-op entirely in observe mode.
 func (a *Actuator) shutdownSafe() {
 	a.duringShutdown = true
+	defer func() {
+		if r := recover(); r != nil {
+			a.st = chargeState{}
+			a.commit = chargeCommitment{}
+			slog.Error("actuator: panic in shutdown fail-safe", "panic", r, "stack", string(debug.Stack()))
+			func() {
+				defer func() {
+					if retryPanic := recover(); retryPanic != nil {
+						slog.Error("actuator: shutdown fail-safe retry also panicked", "panic", retryPanic, "stack", string(debug.Stack()))
+					}
+				}()
+				if err := a.stopCharge("shutdown panic recovery"); err != nil {
+					slog.Warn("actuator: shutdown fail-safe retry failed", "error", err)
+				}
+			}()
+		}
+	}()
 	if err := a.stopCharge("shutdown"); err != nil {
 		slog.Warn("actuator: shutdown fail-safe (disable timed charge) failed", "error", err)
 	}
@@ -366,11 +417,17 @@ func (a *Actuator) safeAfterPanic() {
 // --- policy ---
 
 func (a *Actuator) handlePlan(plan ChargePlan) error {
+	observed := a.syncObservedCharging()
 	if !a.mode.actuates() {
 		slog.Info("actuator: policy (no-op in current mode)",
-			"mode", a.mode, "charging", plan.Charging, "grid_kw", round1(plan.GridKW))
-		a.commit = chargeCommitment{} // don't hold a block across a mode change
+			"mode", a.mode, "charging", plan.Charging, "grid_kw", round1(plan.GridKW), "observed", observed)
+		a.commit = chargeCommitment{}
 		return nil
+	}
+
+	if observed == ChargeOff && a.commit.active {
+		a.commit = chargeCommitment{}
+		return a.stopCharge("safety: timed charge was externally disabled during a committed block")
 	}
 
 	// Deriving `off` from our own tariff config (not the caller) is a layer of the
@@ -458,11 +515,19 @@ func (a *Actuator) extendCommitment(plan ChargePlan) {
 // once correctly configured. Continuing while already charging is just a cheap
 // live current adjust (the switch is already on).
 func (a *Actuator) startCharge(amps float64) error {
-	if a.st.charging {
+	observed := a.observeCharging()
+	if a.st.charging && observed == ChargeOn {
 		return a.adjustCurrent(amps)
 	}
 
 	slog.Info("actuator: START grid charge", "amps", round1(amps))
+	if observed != ChargeOff {
+		if err := a.setTimedCharge(false); err != nil {
+			return fmt.Errorf("disable unowned timed charge before rail verification: %w", err)
+		}
+		a.st.charging = false
+		a.pause()
+	}
 
 	// Ensure the static off-peak window rail (idempotent — usually a no-op after
 	// reconcile). If it does not confirm, do NOT enable: the switch stays off
@@ -482,11 +547,12 @@ func (a *Actuator) startCharge(amps float64) error {
 	if err := a.setTimedCharge(true); err != nil {
 		// Enable unconfirmed — the switch may be off, so record NOT charging and let
 		// the next tick retry the (idempotent) start.
-		a.st = chargeState{amps: round1(amps)}
+		a.st.amps = round1(amps)
 		a.persist()
 		return fmt.Errorf("enable timed charge: %w", err)
 	}
-	a.st = chargeState{charging: true, amps: round1(amps)}
+	a.st.amps = round1(amps)
+	a.st.charging = true
 	a.persist()
 	return nil
 }
@@ -514,37 +580,58 @@ func (a *Actuator) adjustCurrent(amps float64) error {
 // Disable FIRST (this is what actually halts grid charging), THEN zero the
 // current. Gated on mayWrite so the watchdog/reconcile/shutdown fail-safe may
 // call it in watchdog mode too. Idempotent: no writes when already confirmed off.
-//
-// st is cleared to not-charging after the writes are issued, even if the disable
-// read-back did not confirm. This is safe by eventual consistency: setTimedCharge
-// already retries-until-confirmed, and if it still failed, the idempotent guard
-// here (switch not off ⇒ re-issue) plus the watchdog's out-of-window disable
-// re-drive it on the next tick — while a stale st=charging would wrongly suppress
-// exactly that retry.
 func (a *Actuator) stopCharge(reason string) error {
-	// Any genuine stop (policy exit, watchdog backstop, safety, shutdown) ends the
-	// committed block, so it can never re-start it on the next tick.
-	a.commit = chargeCommitment{}
+	observed := a.syncObservedCharging()
 	if !a.mode.mayWrite() {
-		slog.Info("actuator: would stop grid charge (no-op in current mode)", "reason", reason, "mode", a.mode)
+		slog.Info("actuator: would stop grid charge (no-op in current mode)", "reason", reason, "mode", a.mode, "observed", observed)
 		return nil
 	}
-	if !a.st.charging && a.ha.State(a.cfg.TimedChargeSwitch) == switchOff {
-		return nil // already stopped and confirmed off — nothing to write
+	a.commit = chargeCommitment{}
+	if observed == ChargeOff && a.currentConfirmedZero() {
+		a.st.charging = false
+		a.st.amps = 0
+		return nil
 	}
 	slog.Info("actuator: STOP grid charge (timed charge off, current 0)", "reason", reason)
 	var errs []error
-	// Disable FIRST.
-	if err := a.setTimedCharge(false); err != nil {
+	disabled := observed == ChargeOff
+	if !disabled {
+		// Disable FIRST. Only a confirmed disable ends the physical charge episode.
+		if err := a.setTimedCharge(false); err != nil {
+			errs = append(errs, err)
+		} else {
+			disabled = true
+		}
+		a.pause()
+	}
+	if err := a.ensureCurrentZero(); err != nil {
 		errs = append(errs, err)
 	}
-	a.pause()
-	if err := a.setCurrent(0); err != nil {
-		errs = append(errs, err)
+	if disabled {
+		a.st.charging = false
 	}
-	a.st = chargeState{}
 	a.persist()
 	return errors.Join(errs...)
+}
+
+func (a *Actuator) currentConfirmedZero() bool {
+	if !a.ha.Fresh(a.cfg.MainsChargeCurrentNumber, a.cfg.StateStale.Duration) {
+		return false
+	}
+	value, err := strconv.ParseFloat(a.ha.State(a.cfg.MainsChargeCurrentNumber), 64)
+	return err == nil && math.Abs(value) < adjustEpsilon
+}
+
+func (a *Actuator) ensureCurrentZero() error {
+	if a.currentConfirmedZero() {
+		a.st.amps = 0
+		return nil
+	}
+	if err := a.setCurrent(0); err != nil {
+		return err
+	}
+	a.st.amps = 0
+	return nil
 }
 
 // windowWithinOffPeak is the hardware-rail guard on what is written to a
@@ -562,9 +649,10 @@ func (a *Actuator) windowWithinOffPeak(w config.TimeWindow) bool {
 	return false
 }
 
-// midnightHHMM is the "HH:MM" the inverter may misread as a wrap / zero-length
-// window; a mirrored bound landing on it is skipped.
-const midnightHHMM = "00:00"
+const (
+	midnightHHMM   = "00:00"
+	disabledWindow = "00:01"
+)
 
 // insetWindow shrinks w by inset at both ends: [start+inset, end−inset]. ok is
 // false when the window is shorter than 2×inset (the inset would collapse or
@@ -619,46 +707,29 @@ func (a *Actuator) watchdogTicker(ctx context.Context) {
 	}
 }
 
-// handleWatchdog re-asserts the static window rail (self-healing a mid-life
-// scramble) and is the OUT-OF-WINDOW backstop for the new hazard: timed charge
-// left enabled outside every off-peak window (which would recur into future
-// windows, or persist a crashed daemon's charge). Inside a window the per-tick
-// policy path governs enable/disable, so the watchdog only re-asserts windows
-// there. Outside every window, timed charge must be OFF; if it reads on — or the
-// feed is stale/unknown so we cannot confirm it is off — disable it. Disabling is
-// always harmless, so there is no risk of an unwanted write.
+// handleWatchdog is the OUT-OF-WINDOW backstop for timed charge left enabled
+// after the valid off-peak window ends. A legitimate active charge inside a valid
+// window is owned by the policy loop and must be left completely undisturbed: no
+// switch, current, or window writes, and no commitment changes. Outside every
+// window, timed charge is forced to the safe state and the commitment is cleared.
 func (a *Actuator) handleWatchdog() error {
-	var errs []error
-	// Re-assert the static off-peak window rail idempotently (self-heals a mid-life
-	// window scramble). Cheap: it reads each slot and writes only on a mismatch.
-	if a.mode.mayWrite() {
-		if _, err := a.ensureWindowsMirrorOffPeak(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if _, inWindow := a.rates.ActiveWindow(a.now()); inWindow {
-		return errors.Join(errs...)
-	}
-	state := a.ha.State(a.cfg.TimedChargeSwitch)
-	stale := !a.ha.Fresh(a.cfg.TimedChargeSwitch, a.cfg.StateStale.Duration) ||
-		state == "" || state == "unknown" || state == "unavailable"
-	if state != switchOn && !stale {
-		return errors.Join(errs...) // confirmed off outside every window — nothing to do
+	observed := a.syncObservedCharging()
+	_, offPeak := a.rates.ActiveWindow(a.now())
+	if offPeak && (observed == ChargeOff || observed == ChargeOn && a.st.charging) {
+		return nil
 	}
 	if !a.mode.mayWrite() {
-		slog.Warn("actuator: watchdog would disable timed charge (no-op in current mode)",
-			"switch", state, "stale", stale, "mode", a.mode)
-		return errors.Join(errs...)
+		if observed != ChargeOff {
+			slog.Warn("actuator: watchdog would disable unowned or out-of-window timed charge (no-op in current mode)",
+				"observed", observed, "off_peak", offPeak, "mode", a.mode)
+		}
+		return nil
 	}
-	reason := "watchdog: timed charge enabled outside off-peak window"
-	if stale {
-		reason = "watchdog: timed-charge feed stale/unknown outside off-peak window"
+	reason := "watchdog: outside off-peak window"
+	if offPeak {
+		reason = "watchdog: timed charge is not freshly confirmed as actuator-owned"
 	}
-	if err := a.stopCharge(reason); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return a.stopCharge(reason)
 }
 
 // --- startup reconciliation ---
@@ -671,27 +742,36 @@ func (a *Actuator) handleWatchdog() error {
 // grid charge. Toggling timed charge is not a power blip, so this costs at most a
 // few minutes of deferred charging on restart, in exchange for never charging on
 // stale intent.
-func (a *Actuator) reconcile(ctx context.Context) error {
+func (a *Actuator) reconcile(ctx context.Context) (err error) {
 	_ = ctx
+	defer func() {
+		if r := recover(); r != nil {
+			a.st = chargeState{}
+			a.commit = chargeCommitment{}
+			a.safeAfterPanic()
+			err = fmt.Errorf("actuator: recovered panic in startup reconcile: %v", r)
+		}
+	}()
 	a.verifyEntities()
-	a.st = chargeState{}
+	observed := a.syncObservedCharging()
 	if !a.mode.mayWrite() {
 		slog.Info("actuator: startup reconcile (no-op in current mode)",
-			"mode", a.mode, "timed_charge", a.ha.State(a.cfg.TimedChargeSwitch))
+			"mode", a.mode, "timed_charge", a.ha.State(a.cfg.TimedChargeSwitch), "observed", observed)
 		return nil
 	}
-	slog.Info("actuator: startup reconcile — mirroring off-peak window rail, ensuring timed charge OFF",
+	slog.Info("actuator: startup reconcile — ensuring timed charge OFF before verifying hardware rail",
 		"timed_charge", a.ha.State(a.cfg.TimedChargeSwitch), "mode", a.mode)
 	var errs []error
-	// Establish the static off-peak window rail first, then ensure the switch is off.
-	wrote, err := a.ensureWindowsMirrorOffPeak()
-	if err != nil {
+	if observed != ChargeOff {
+		if err := a.stopCharge("startup reconcile"); err != nil {
+			errs = append(errs, err)
+			return errors.Join(errs...)
+		}
+	}
+	if _, err := a.ensureWindowsMirrorOffPeak(); err != nil {
 		errs = append(errs, err)
 	}
-	if wrote {
-		a.pause()
-	}
-	if err := a.stopCharge("startup reconcile"); err != nil {
+	if err := a.ensureCurrentZero(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -725,17 +805,23 @@ func (a *Actuator) callAck(domain, service string, data map[string]any) error {
 // (spaced) up to maxWriteRetries times to defeat the SRNE's dropped-write
 // behaviour. Re-issuing is safe here: these writes are idempotent and NOT power
 // blips, so retry-until-confirmed carries no double-spend hazard.
-func (a *Actuator) writeConfirmed(desc string, write func() error, confirmed func() bool) error {
+func (a *Actuator) writeConfirmed(desc, entityID string, write func() error, matches func() bool) error {
 	var err error
 	for attempt := 0; attempt <= maxWriteRetries; attempt++ {
 		if attempt > 0 {
 			slog.Warn("actuator: write not confirmed — retrying (spaced)", "write", desc, "attempt", attempt)
 			a.pause()
 		}
+		if a.ha.Fresh(entityID, a.cfg.StateStale.Duration) && matches() {
+			return nil
+		}
+		generation := a.ha.UpdateGeneration(entityID)
 		if err = write(); err != nil {
 			continue
 		}
-		if a.awaitConfirmed(confirmed) {
+		if a.awaitConfirmed(func() bool {
+			return a.ha.UpdateGeneration(entityID) > generation && matches()
+		}) {
 			return nil
 		}
 		err = fmt.Errorf("actuator: %s not confirmed within %s", desc, a.confirmTimeout)
@@ -750,7 +836,7 @@ func (a *Actuator) setTimedCharge(on bool) error {
 	if on {
 		service, want = "turn_on", switchOn
 	}
-	return a.writeConfirmed("timed_charge="+want,
+	return a.writeConfirmed("timed_charge="+want, a.cfg.TimedChargeSwitch,
 		func() error {
 			return a.callAck(switchDomain, service, map[string]any{"entity_id": a.cfg.TimedChargeSwitch})
 		},
@@ -761,7 +847,7 @@ func (a *Actuator) setTimedCharge(on bool) error {
 // setCurrent sets the per-unit mains charge current (A), confirmed via read-back.
 func (a *Actuator) setCurrent(amps float64) error {
 	val := round1(amps)
-	return a.writeConfirmed(fmt.Sprintf("mains_charge_current=%.1f", val),
+	return a.writeConfirmed(fmt.Sprintf("mains_charge_current=%.1f", val), a.cfg.MainsChargeCurrentNumber,
 		func() error {
 			return a.callAck(numberDomain, "set_value", map[string]any{
 				"entity_id": a.cfg.MainsChargeCurrentNumber,
@@ -769,14 +855,15 @@ func (a *Actuator) setCurrent(amps float64) error {
 			})
 		},
 		func() bool {
-			return math.Abs(a.ha.StateFloat(a.cfg.MainsChargeCurrentNumber)-val) < adjustEpsilon
+			current, err := strconv.ParseFloat(a.ha.State(a.cfg.MainsChargeCurrentNumber), 64)
+			return err == nil && math.Abs(current-val) < adjustEpsilon
 		},
 	)
 }
 
 // setWindowText writes one charge-window bound ("HH:MM"), confirmed via read-back.
 func (a *Actuator) setWindowText(entityID, hhmm string) error {
-	return a.writeConfirmed(fmt.Sprintf("%s=%s", entityID, hhmm),
+	return a.writeConfirmed(fmt.Sprintf("%s=%s", entityID, hhmm), entityID,
 		func() error {
 			return a.callAck(textDomain, "set_value", map[string]any{
 				"entity_id": entityID,
@@ -787,71 +874,50 @@ func (a *Actuator) setWindowText(entityID, hhmm string) error {
 	)
 }
 
-// ensureWindowsMirrorOffPeak programs the inverter's charge-window slots to
-// STATICALLY mirror the configured off-peak periods (slot i ← off-peak window i),
-// inset by WindowInset at both ends — the hardware rail. Idempotent: a slot bound
-// is written only when its read-back differs from the intended value, so a steady
-// state issues no writes and there is no churn. Slots WITHOUT a corresponding
-// off-peak window are left UNTOUCHED (never zeroed): the global enable switch, off
-// outside off-peak, governs whether charging happens. A slot is SKIPPED (logged)
-// when the off-peak window is shorter than 2×inset, when the inset interval is not
-// wholly off-peak (windowWithinOffPeak guard), or when a mirrored bound would land
-// on 00:00 (which the inverter may misread as a wrap / zero-length window).
-// Returns whether any write was issued (so the caller can space a following write)
-// plus any error.
+// ensureWindowsMirrorOffPeak proves every configured hardware slot safe. A slot
+// either mirrors one valid inset off-peak interval, or is explicitly disabled by
+// equal non-midnight bounds. Missing/unmanageable slots fail closed.
 func (a *Actuator) ensureWindowsMirrorOffPeak() (bool, error) {
 	windows := a.rates.OffPeakWindows
 	if len(windows) > len(a.cfg.ChargeWindows) {
-		slog.Warn("actuator: more off-peak windows than inverter charge-window slots — "+
-			"the excess periods have no charge window and cannot be grid-charged",
-			"off_peak_windows", len(windows), "slots", len(a.cfg.ChargeWindows))
+		return false, fmt.Errorf("actuator: %d off-peak windows exceed %d hardware slots", len(windows), len(a.cfg.ChargeWindows))
 	}
 
 	inset := a.cfg.WindowInset.Duration
-	var errs []error
 	wrote := false
 	for i, slot := range a.cfg.ChargeWindows {
-		if i >= len(windows) {
-			break // no off-peak period for this slot — leave it untouched
+		if slot.Start == "" || slot.End == "" {
+			return wrote, fmt.Errorf("actuator: charge-window slot %d has missing entity IDs", i+1)
 		}
-		w := windows[i]
-
-		insetW, ok := insetWindow(w, inset)
-		if !ok {
-			slog.Warn("actuator: off-peak window shorter than 2×inset — skipping charge-window slot",
-				"slot", i+1, "start", w.Start, "end", w.End, "inset", inset)
-			continue
-		}
-		if !a.windowWithinOffPeak(insetW) {
-			slog.Error("actuator: RAIL — refusing to program a charge-window slot with a "+
-				"non-off-peak interval", "slot", i+1, "start", insetW.Start, "end", insetW.End)
-			continue
-		}
-		startHHMM, endHHMM := insetW.Start.String(), insetW.End.String()
-		if startHHMM == midnightHHMM || endHHMM == midnightHHMM {
-			slog.Warn("actuator: mirrored charge window would write a 00:00 (midnight) bound — "+
-				"skipping charge-window slot to avoid a wrap/zero-length misread",
-				"slot", i+1, "start", startHHMM, "end", endHHMM)
-			continue
+		startHHMM, endHHMM := disabledWindow, disabledWindow
+		if i < len(windows) {
+			insetW, ok := insetWindow(windows[i], inset)
+			if !ok || !a.windowWithinOffPeak(insetW) {
+				return wrote, fmt.Errorf("actuator: charge-window slot %d cannot represent a safe off-peak interval", i+1)
+			}
+			startHHMM, endHHMM = insetW.Start.String(), insetW.End.String()
+			if startHHMM == midnightHHMM || endHHMM == midnightHHMM || startHHMM == endHHMM {
+				return wrote, fmt.Errorf("actuator: charge-window slot %d has unsafe interval %s-%s", i+1, startHHMM, endHHMM)
+			}
 		}
 
 		for _, wr := range [...]struct{ entity, want string }{
 			{slot.Start, startHHMM},
 			{slot.End, endHHMM},
 		} {
-			if wr.entity == "" || a.ha.State(wr.entity) == wr.want {
-				continue // unset entity, or already correct — no write, no spacing
+			if a.ha.Fresh(wr.entity, a.cfg.StateStale.Duration) && a.ha.State(wr.entity) == wr.want {
+				continue
 			}
 			if wrote {
 				a.pause()
 			}
 			if err := a.setWindowText(wr.entity, wr.want); err != nil {
-				errs = append(errs, err)
+				return true, fmt.Errorf("actuator: prove charge-window slot %d safe: %w", i+1, err)
 			}
 			wrote = true
 		}
 	}
-	return wrote, errors.Join(errs...)
+	return wrote, nil
 }
 
 func (a *Actuator) windowEntityIDs() []string {
@@ -1029,10 +1095,7 @@ func (a *Actuator) loadPersist() {
 	if err := json.Unmarshal(data, &ps); err != nil {
 		return
 	}
-	a.st = chargeState{
-		charging: ps.Charging,
-		amps:     ps.Amps,
-	}
+	a.st = chargeState{amps: ps.Amps}
 }
 
 func round1(v float64) float64 { return math.Round(v*10) / 10 }

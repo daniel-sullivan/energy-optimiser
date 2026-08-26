@@ -12,11 +12,16 @@ import (
 
 	"energy-optimiser/config"
 	"energy-optimiser/optimizer"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type gotAlert struct {
 	Labels      map[string]string `json:"labels"`
 	Annotations map[string]string `json:"annotations"`
+	StartsAt    time.Time         `json:"startsAt"`
+	EndsAt      time.Time         `json:"endsAt"`
 }
 
 // captureAM records every alert POSTed to /api/v2/alerts.
@@ -77,77 +82,287 @@ func TestAlertManagerDisabledIsNoop(t *testing.T) {
 	}
 }
 
-// TestChargeAlertStableIdentity is the core regression: the alert identity (its
-// label set) must NOT depend on live SoC, so Alertmanager dedupes it instead of
-// re-firing every 1% tick. The summary reports energy added over the charge run.
-func TestChargeAlertStableIdentity(t *testing.T) {
+func TestConfirmedChargeLifecycleFreezesSummaryAcrossForecastChurn(t *testing.T) {
 	srv, got := captureAM(t)
 	defer srv.Close()
 	n := testNotifier(srv.URL)
-
 	now := time.Date(2026, 7, 21, 7, 0, 0, 0, time.UTC)
-	sched := &optimizer.Schedule{Slots: []optimizer.Slot{
-		{Start: now.Add(1 * time.Hour), SOC: 0.30},                       // "before" the run
-		{Start: now.Add(2 * time.Hour), SOC: 0.50, GridCharge: true},     // run start
-		{Start: now.Add(150 * time.Minute), SOC: 0.60, GridCharge: true}, // run end
-	}}
 
-	n.Evaluate(context.Background(), now, sched, 0.28)
-	n.Evaluate(context.Background(), now, sched, 0.55) // live SoC differs; plan identical
+	assert.NoError(t, n.Lifecycle(context.Background(), now, ChargeStatus{
+		State:   ChargeOn,
+		Context: &ChargeContext{Start: now, InitialSOC: 0.4, TargetSOC: 0.7},
+	}))
+	require.NoError(t, n.Lifecycle(context.Background(), now.Add(5*time.Minute), ChargeStatus{State: ChargeOn}))
+	require.NoError(t, n.Lifecycle(context.Background(), now.Add(10*time.Minute), ChargeStatus{State: ChargeOn}))
 
 	alerts := got()
-	if len(alerts) != 2 {
-		t.Fatalf("expected 2 posts, got %d", len(alerts))
+	require.Len(t, alerts, 3, "expected one firing post and two heartbeats")
+	for i := range alerts {
+		if alerts[i].Labels["alertname"] != "EnergyOptimiserGridCharge" {
+			assert.Failf(t, "assertion failed", "post %d must be grid-charge alert: %+v", i, alerts[i])
+		}
+		if alerts[i].Labels["site"] != "home" || alerts[i].Labels["severity"] != "warning" {
+			assert.Failf(t, "assertion failed", "post %d must retain fixed routable labels: %+v", i, alerts[i].Labels)
+		}
+		if !alerts[i].StartsAt.Equal(now) || alerts[i].Annotations["summary"] != alerts[0].Annotations["summary"] {
+			assert.Failf(t, "assertion failed", "post %d changed the frozen episode identity or summary: %+v", i, alerts[i])
+		}
 	}
-	a0, a1 := &alerts[0], &alerts[1]
-	if a0.Labels["alertname"] != "EnergyOptimiserGridCharge" || a1.Labels["alertname"] != "EnergyOptimiserGridCharge" {
-		t.Fatalf("both posts must carry the grid-charge alert: %+v", alerts)
-	}
-	// Identical labels (so AM dedupes) + identical summary despite different live SoC.
-	if a0.Labels["site"] != "home" || a0.Labels["severity"] != "warning" {
-		t.Fatalf("labels must be routable: %+v", a0.Labels)
-	}
-	if a0.Annotations["summary"] != a1.Annotations["summary"] {
-		t.Fatalf("summary must not depend on live SoC: %q vs %q", a0.Annotations["summary"], a1.Annotations["summary"])
-	}
-	// Energy added over the run: (0.60 - 0.30) * 49.8 ≈ 14.9 kWh, and the SoC span.
-	if !strings.Contains(a0.Annotations["summary"], "kWh") || !strings.Contains(a0.Annotations["summary"], "30% → 60%") {
-		t.Fatalf("summary should report energy + SoC span: %q", a0.Annotations["summary"])
+	if !strings.Contains(alerts[0].Annotations["summary"], "14.9 kWh") || !strings.Contains(alerts[0].Annotations["summary"], "40% → 70%") {
+		assert.Failf(t, "assertion failed", "initial summary must preserve initial plan context: %q", alerts[0].Annotations["summary"])
 	}
 }
 
-// TestActiveChargeSlotStillFires covers the review's HIGH-1: a grid-charge slot
-// in progress (start in the past, end in the future) must still fire, not
-// falsely resolve mid-charge.
-func TestActiveChargeSlotStillFires(t *testing.T) {
+func TestConfirmedChargeStopPostsOneExplicitResolve(t *testing.T) {
 	srv, got := captureAM(t)
 	defer srv.Close()
 	n := testNotifier(srv.URL)
-
-	now := time.Date(2026, 7, 21, 2, 10, 0, 0, time.UTC)
-	sched := &optimizer.Schedule{Slots: []optimizer.Slot{
-		{Start: now.Add(-10 * time.Minute), SOC: 0.5, GridCharge: true}, // active (30-min slot)
-	}}
-	n.Evaluate(context.Background(), now, sched, 0.50)
-
-	if find(got(), "EnergyOptimiserGridCharge") == nil {
-		t.Fatal("active grid-charge slot must still fire the alert")
-	}
-}
-
-func TestNoChargeNoAlert(t *testing.T) {
-	srv, got := captureAM(t)
-	defer srv.Close()
-	n := testNotifier(srv.URL)
-
 	now := time.Date(2026, 7, 21, 7, 0, 0, 0, time.UTC)
-	sched := &optimizer.Schedule{Slots: []optimizer.Slot{
-		{Start: now.Add(1 * time.Hour), SOC: 0.8},
-	}}
-	n.Evaluate(context.Background(), now, sched, 0.80)
 
+	require.NoError(t, n.Lifecycle(context.Background(), now, ChargeStatus{State: ChargeOn}))
+	stop := now.Add(5 * time.Minute)
+	require.NoError(t, n.Lifecycle(context.Background(), stop, ChargeStatus{State: ChargeOff}))
+	require.NoError(t, n.Lifecycle(context.Background(), stop.Add(5*time.Minute), ChargeStatus{State: ChargeOff}))
+
+	alerts := got()
+	require.Len(t, alerts, 2, "expected start and one explicit resolve")
+	if !alerts[1].EndsAt.Equal(stop) {
+		assert.Failf(t, "assertion failed", "resolved alert EndsAt=%v, want stop time %v", alerts[1].EndsAt, stop)
+	}
+	if !alerts[1].StartsAt.Equal(alerts[0].StartsAt) || alerts[1].Annotations["summary"] != alerts[0].Annotations["summary"] {
+		assert.Failf(t, "assertion failed", "resolve must use same alert fingerprint and frozen summary: start=%+v resolve=%+v", alerts[0], alerts[1])
+	}
+}
+
+func TestUnconfirmedChargeDoesNotAlertAndBasicStartIsValid(t *testing.T) {
+	srv, got := captureAM(t)
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	now := time.Date(2026, 7, 21, 7, 0, 0, 0, time.UTC)
+
+	require.NoError(t, n.Lifecycle(context.Background(), now, ChargeStatus{State: ChargeOff}))
 	if find(got(), "EnergyOptimiserGridCharge") != nil {
-		t.Fatal("no charge planned -> no grid-charge alert")
+		assert.Fail(t, "a planned but unconfirmed charge must not alert")
+	}
+	require.NoError(t, n.Lifecycle(context.Background(), now.Add(time.Minute), ChargeStatus{State: ChargeOn}))
+	alerts := got()
+	if len(alerts) != 1 || alerts[0].Annotations["summary"] != "⚡ Grid charging observed." {
+		assert.Failf(t, "assertion failed", "confirmed charge without block context must emit basic start summary: %+v", alerts)
+	}
+}
+
+func TestResolveFailureRetriesTransactionally(t *testing.T) {
+	var mu sync.Mutex
+	fail := false
+	var alerts []gotAlert
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var batch []gotAlert
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		alerts = append(alerts, batch...)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	now := time.Date(2026, 7, 21, 7, 0, 0, 0, time.UTC)
+	require.NoError(t, n.Lifecycle(context.Background(), now, ChargeStatus{State: ChargeOn}))
+	mu.Lock()
+	fail = true
+	mu.Unlock()
+	if err := n.Lifecycle(context.Background(), now.Add(time.Minute), ChargeStatus{State: ChargeOff}); err == nil {
+		assert.Fail(t, "failed resolve delivery must return an error")
+	}
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	require.NoError(t, n.Lifecycle(context.Background(), now.Add(2*time.Minute), ChargeStatus{State: ChargeOff}))
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 2 || !alerts[1].EndsAt.Equal(now.Add(2*time.Minute)) {
+		assert.Failf(t, "assertion failed", "resolve must retry after failure, got %+v", alerts)
+	}
+}
+
+func TestUnknownDoesNotResolveAndWallLeaseIsFuture(t *testing.T) {
+	srv, got := captureAM(t)
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	wallNow := time.Date(2026, 7, 21, 7, 4, 59, 0, time.UTC)
+	require.NoError(t, n.Lifecycle(context.Background(), wallNow, ChargeStatus{State: ChargeOn}))
+	require.NoError(t, n.Lifecycle(context.Background(), wallNow.Add(time.Minute), ChargeStatus{State: ChargeUnknown}))
+	alerts := got()
+	require.Len(t, alerts, 2, "unknown observation must heartbeat an existing episode")
+	if !alerts[1].StartsAt.Equal(alerts[0].StartsAt) || !alerts[1].EndsAt.After(wallNow.Add(time.Minute)) {
+		assert.Failf(t, "assertion failed", "unknown heartbeat must preserve the episode and extend its wall-clock lease: %+v", alerts)
+	}
+	if alerts[0].StartsAt.Truncate(5 * time.Minute).Equal(alerts[0].StartsAt) {
+		assert.Failf(t, "assertion failed", "alert timestamps must use real wall time rather than slot-truncated decision time: %+v", alerts[0])
+	}
+}
+
+func TestFailedStartRetriesWithFrozenContext(t *testing.T) {
+	var mu sync.Mutex
+	fail := true
+	var alerts []gotAlert
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var batch []gotAlert
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		alerts = append(alerts, batch...)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	now := time.Date(2026, 7, 21, 7, 1, 0, 0, time.UTC)
+	contextAtStart := &ChargeContext{InitialSOC: 0.4, TargetSOC: 0.7}
+	if err := n.Lifecycle(context.Background(), now, ChargeStatus{State: ChargeOn, Context: contextAtStart}); err == nil {
+		assert.Fail(t, "failed start delivery must return an error")
+	}
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	assert.NoError(t, n.Lifecycle(context.Background(), now.Add(time.Minute), ChargeStatus{
+		State:   ChargeOn,
+		Context: &ChargeContext{InitialSOC: 0.5, TargetSOC: 0.9},
+	}))
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0].Annotations["summary"], "40% → 70%") {
+		assert.Failf(t, "assertion failed", "retry must preserve the first start context, got %+v", alerts)
+	}
+	if !alerts[0].StartsAt.Equal(now) {
+		assert.Failf(t, "assertion failed", "retry must preserve the first observed start time, got %v want %v", alerts[0].StartsAt, now)
+	}
+}
+
+func TestFailedStartThenUnknownRetriesFrozenEpisode(t *testing.T) {
+	var mu sync.Mutex
+	fail := true
+	var alerts []gotAlert
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var batch []gotAlert
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		alerts = append(alerts, batch...)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	now := time.Date(2026, 7, 21, 7, 1, 0, 0, time.UTC)
+	if err := n.Lifecycle(context.Background(), now, ChargeStatus{
+		State: ChargeOn, Context: &ChargeContext{InitialSOC: 0.4, TargetSOC: 0.7},
+	}); err == nil {
+		assert.Fail(t, "failed start delivery must return an error")
+	}
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	require.NoError(t, n.Lifecycle(context.Background(), now.Add(time.Minute), ChargeStatus{State: ChargeUnknown}))
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !alerts[0].StartsAt.Equal(now) || !strings.Contains(alerts[0].Annotations["summary"], "40% → 70%") {
+		assert.Failf(t, "assertion failed", "unknown must retry the frozen pending episode, got %+v", alerts)
+	}
+}
+
+func TestFailedStartThenOffResolvesFrozenEpisode(t *testing.T) {
+	var mu sync.Mutex
+	fail := true
+	var alerts []gotAlert
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var batch []gotAlert
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		alerts = append(alerts, batch...)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	now := time.Date(2026, 7, 21, 7, 1, 0, 0, time.UTC)
+	if err := n.Lifecycle(context.Background(), now, ChargeStatus{State: ChargeOn}); err == nil {
+		assert.Fail(t, "failed start delivery must return an error")
+	}
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	stopped := now.Add(time.Minute)
+	require.NoError(t, n.Lifecycle(context.Background(), stopped, ChargeStatus{State: ChargeOff}))
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !alerts[0].StartsAt.Equal(now) || !alerts[0].EndsAt.Equal(stopped) {
+		assert.Failf(t, "assertion failed", "off must resolve the frozen pending episode, got %+v", alerts)
+	}
+}
+
+func TestUnknownWithoutEpisodeDoesNothing(t *testing.T) {
+	srv, got := captureAM(t)
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	require.NoError(t, n.Lifecycle(context.Background(), time.Now(), ChargeStatus{State: ChargeUnknown}))
+	if len(got()) != 0 {
+		assert.Fail(t, "unknown without an existing or pending episode must not synthesize a start")
+	}
+}
+
+func TestConcurrentStartAndResolveAreSerialized(t *testing.T) {
+	var mu sync.Mutex
+	var alerts []gotAlert
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		request := requests
+		mu.Unlock()
+		if request == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		var batch []gotAlert
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		mu.Lock()
+		alerts = append(alerts, batch...)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	n := testNotifier(srv.URL)
+	now := time.Date(2026, 7, 21, 7, 0, 0, 0, time.UTC)
+	startDone := make(chan error, 1)
+	go func() { startDone <- n.Lifecycle(context.Background(), now, ChargeStatus{State: ChargeOn}) }()
+	<-firstStarted
+	resolveDone := make(chan error, 1)
+	go func() {
+		resolveDone <- n.Lifecycle(context.Background(), now.Add(time.Minute), ChargeStatus{State: ChargeOff})
+	}()
+	close(releaseFirst)
+	require.NoError(t, <-startDone)
+	require.NoError(t, <-resolveDone)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 2 || !alerts[1].EndsAt.Equal(now.Add(time.Minute)) {
+		assert.Failf(t, "assertion failed", "serialized resolve must follow the firing delivery, got %+v", alerts)
 	}
 }
 
@@ -161,7 +376,9 @@ func TestLowSOCAlert(t *testing.T) {
 		{Start: now.Add(2 * time.Hour), SOC: 0.30},
 		{Start: now.Add(6 * time.Hour), SOC: 0.12},
 	}}
-	n.Evaluate(context.Background(), now, sched, 0.30)
+	if err := n.Forecast(context.Background(), now, sched); err != nil {
+		t.Fatal(err)
+	}
 
 	a := find(got(), "EnergyOptimiserLowSoC")
 	if a == nil {
