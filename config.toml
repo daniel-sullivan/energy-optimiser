@@ -127,7 +127,7 @@ device_id = "srne_system"                 # actuation target: your inverter's MQ
 # watchdog_interval = "30s"       # cadence of the never-charging-outside-off-peak safety check + window-rail re-assert
 # write_timeout = "10s"           # per inverter write + ack
 # read_back_timeout = "45s"       # bound on the read-back that confirms a write landed (SRNE echo ~20-40s); too short churns retries
-# state_stale = "5m"              # timed-charge switch reading older than this → watchdog disables it outside a window
+# state_stale = "5m"              # max age of the SRNE feed (judged on the live sensor entities, not the quiescent switch) still trusted for gating; older ⇒ feed treated dead, watchdog fails closed
 #
 # The inverter's 3 timed-charge window slots ("HH:MM" text entities). The actuator
 # statically mirrors slot i to configured off-peak window i (idempotently); slots

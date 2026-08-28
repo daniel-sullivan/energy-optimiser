@@ -68,6 +68,7 @@ type haClient interface {
 	Attributes(entityID string) map[string]any
 	UpdateGeneration(entityID string) uint64
 	Fresh(entityID string, within time.Duration) bool
+	Connected() bool
 }
 
 // ChargeObservation is the fresh observed state of Home Assistant's timed-charge
@@ -251,12 +252,38 @@ func (a *Actuator) ChargingObserved() ChargeObservation {
 	return a.observeCharging()
 }
 
+// feedLive reports whether the SRNE live feed is still delivering: any of the
+// co-published sensor entities (battery/PV/grid/load power, SoC) refreshed within
+// StateStale. The actuation entities (switch, current, window texts) are quiescent
+// by nature — they emit no state_changed until they change — so a stale timestamp
+// on one of THEM does not mean the reading is wrong, and cannot tell a healthy long
+// charge from a dead feed. These fast-moving measurements all freeze together if
+// the SRNE controller dies, so their freshness is the correct liveness probe; when
+// they all go stale, gating falls back to a safe unknown and the watchdog fails
+// closed.
+func (a *Actuator) feedLive() bool {
+	if len(a.cfg.LivenessEntities) == 0 {
+		// No liveness probe configured (the SRNE sensors are all unset): fall back to
+		// the raw connection state rather than wedge every gate false forever.
+		return a.ha.Connected()
+	}
+	for _, e := range a.cfg.LivenessEntities {
+		if a.ha.Fresh(e, a.cfg.StateStale.Duration) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *Actuator) observeCharging() ChargeObservation {
-	state := a.ha.State(a.cfg.TimedChargeSwitch)
-	if !a.ha.Fresh(a.cfg.TimedChargeSwitch, a.cfg.StateStale.Duration) {
+	// Trust the switch's last-known value while the feed is live (see feedLive); a
+	// dead feed, or an unavailable/unknown state, is Unknown — so the watchdog fails
+	// safe on a genuinely frozen feed but not on a healthy long charge whose switch
+	// simply hasn't changed.
+	if !a.feedLive() {
 		return ChargeUnknown
 	}
-	switch state {
+	switch a.ha.State(a.cfg.TimedChargeSwitch) {
 	case switchOff:
 		return ChargeOff
 	case switchOn:
@@ -615,7 +642,7 @@ func (a *Actuator) stopCharge(reason string) error {
 }
 
 func (a *Actuator) currentConfirmedZero() bool {
-	if !a.ha.Fresh(a.cfg.MainsChargeCurrentNumber, a.cfg.StateStale.Duration) {
+	if !a.feedLive() {
 		return false
 	}
 	value, err := strconv.ParseFloat(a.ha.State(a.cfg.MainsChargeCurrentNumber), 64)
@@ -812,7 +839,12 @@ func (a *Actuator) writeConfirmed(desc, entityID string, write func() error, mat
 			slog.Warn("actuator: write not confirmed — retrying (spaced)", "write", desc, "attempt", attempt)
 			a.pause()
 		}
-		if a.ha.Fresh(entityID, a.cfg.StateStale.Duration) && matches() {
+		// Already at target with a live feed: the cache is HA's truth, so a match is
+		// a confirmed no-op — skip the redundant idempotent write. A dropped real
+		// change leaves the cache at the old value, so matches() is false and we fall
+		// through to write-and-confirm (a new generation) below; a dead feed is not
+		// live, so we never skip a write against a cache we can no longer trust.
+		if a.feedLive() && matches() {
 			return nil
 		}
 		generation := a.ha.UpdateGeneration(entityID)
@@ -905,7 +937,7 @@ func (a *Actuator) ensureWindowsMirrorOffPeak() (bool, error) {
 			{slot.Start, startHHMM},
 			{slot.End, endHHMM},
 		} {
-			if a.ha.Fresh(wr.entity, a.cfg.StateStale.Duration) && a.ha.State(wr.entity) == wr.want {
+			if a.feedLive() && a.ha.State(wr.entity) == wr.want {
 				continue
 			}
 			if wrote {

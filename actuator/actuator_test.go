@@ -35,8 +35,9 @@ type fakeHA struct {
 	states     map[string]string
 	attrs      map[string]map[string]any
 	generation map[string]uint64
-	fresh      map[string]bool // per-entity; absent ⇒ freshOK
+	fresh      map[string]bool // per-entity liveness; absent ⇒ freshOK
 	freshOK    bool            // default when entity absent from `fresh`
+	connected  bool            // raw connection state (feedLive fallback when no liveness entities)
 	ackErr     error           // if set, CallServiceAck returns it (no reflect)
 	calls      []recordedCall
 
@@ -57,6 +58,7 @@ func newFakeHA() *fakeHA {
 		generation: map[string]uint64{},
 		fresh:      map[string]bool{},
 		freshOK:    true,
+		connected:  true,
 		dropOnce:   map[string]int{},
 	}
 }
@@ -92,7 +94,6 @@ func (f *fakeHA) CallServiceAck(_ context.Context, domain, service string, data 
 		}
 	}
 	f.generation[entity]++
-	f.fresh[entity] = true
 	return nil
 }
 
@@ -126,6 +127,12 @@ func (f *fakeHA) Fresh(entityID string, _ time.Duration) bool {
 		return v
 	}
 	return f.freshOK
+}
+
+func (f *fakeHA) Connected() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.connected
 }
 
 func (f *fakeHA) setState(entityID, state string) {
@@ -235,8 +242,9 @@ func testRates(t *testing.T) *config.Rates {
 }
 
 const (
-	switchEntity = "switch.timed_charge"
-	ampsEntity   = "number.mains_a"
+	switchEntity   = "switch.timed_charge"
+	ampsEntity     = "number.mains_a"
+	livenessEntity = "sensor.srne_battery_power" // fast-moving feed-liveness probe
 	w1s          = "text.w1_start"
 	w1e          = "text.w1_end"
 	w2s          = "text.w2_start"
@@ -264,6 +272,7 @@ func testCfg(t *testing.T) config.ActuatorHW {
 		WriteTimeout:      config.Duration{Duration: time.Second},
 		ReadBackTimeout:   config.Duration{Duration: 150 * time.Millisecond},
 		StateStale:        config.Duration{Duration: 5 * time.Minute},
+		LivenessEntities:  []string{livenessEntity},
 	}
 }
 
@@ -399,9 +408,8 @@ func TestSteadyStateStartupNoWrites(t *testing.T) {
 
 // --- start: current + enable-last, no window rewriting ---
 
-// TestStartSetsCurrentEnablesLast proves a fresh charge sets the per-unit current
-// and enables timed charge LAST (after the current), and does NOT rewrite the
-// static window rail.
+// TestSurplusSlotDisabledBeforeEnable proves a charge start disables every surplus
+// slot (during reconcile) before enabling timed charge.
 func TestSurplusSlotDisabledBeforeEnable(t *testing.T) {
 	fake := newFakeHA()
 	fake.setState(ampsEntity, "0")
@@ -569,39 +577,88 @@ func TestStopWhenIdleIsNoOp(t *testing.T) {
 
 // --- write spacing + retry-until-confirmed ---
 
-// TestFreshPreWriteTargetSkipsIdempotentWrite proves a fresh cache already at
-// the target avoids an unnecessary service call rather than treating a later ACK
-// as causal proof that a potentially dropped write landed.
-func TestFreshPreWriteTargetSkipsIdempotentWrite(t *testing.T) {
-	fake := newFakeHA()
-	fake.setState(switchEntity, switchOff)
-	fake.setState(ampsEntity, "10")
-	a := rawActuator(t, fake, testRates(t), testCfg(t))
-
-	require.NoError(t, a.setCurrent(10), "fresh idempotent target must succeed without a write")
-	if got := fake.countSet(ampsEntity); got != 0 {
-		assert.Failf(t, "assertion failed", "fresh idempotent target must skip the service call, got %d writes", got)
-	}
-}
-
-// TestStalePreWriteTargetCannotConfirmWrite proves a matching but stale cache
-// never confirms an acknowledged write: a new matching state generation remains
-// required when the pre-attempt observation is not fresh.
-func TestStalePreWriteTargetCannotConfirmWrite(t *testing.T) {
+// TestLiveFeedIdempotentNoOpConfirmsWithoutWrite is the outage regression: a value
+// already at target on a live feed confirms as a no-op even for a quiescent entity
+// that emits no further state_changed event. dropOnce would make any issued write
+// unconfirmable, so a pass proves no write was issued — the pre-f8d59ba behaviour
+// the per-entity freshness gate had broken (every idempotent write ran to a 45s
+// timeout, wedging actuation).
+func TestLiveFeedIdempotentNoOpConfirmsWithoutWrite(t *testing.T) {
 	fake := newFakeHA()
 	fake.setState(switchEntity, switchOff)
 	fake.setState(ampsEntity, "10")
 	fake.mu.Lock()
-	fake.fresh[ampsEntity] = false
 	fake.dropOnce[ampsEntity] = 1000
 	fake.mu.Unlock()
 	a := rawActuator(t, fake, testRates(t), testCfg(t))
 
+	require.NoError(t, a.setCurrent(10), "live-feed idempotent target must confirm as a no-op")
+	if got := fake.countSet(ampsEntity); got != 0 {
+		assert.Failf(t, "assertion failed", "live-feed idempotent target must skip the write, got %d writes", got)
+	}
+}
+
+// TestDroppedChangeNeverFalselyConfirms proves the dropped-write guard still holds
+// where it matters: a real change (cache != target) whose writes the SRNE keeps
+// dropping never confirms — it re-issues and finally errors rather than trusting
+// an unlanded write.
+func TestDroppedChangeNeverFalselyConfirms(t *testing.T) {
+	fake := newFakeHA()
+	fake.setState(switchEntity, switchOff)
+	fake.setState(ampsEntity, "0")
+	fake.mu.Lock()
+	fake.dropOnce[ampsEntity] = 1000 // every write acked but never reflected
+	fake.mu.Unlock()
+	a := rawActuator(t, fake, testRates(t), testCfg(t))
+
 	if err := a.setCurrent(10); err == nil {
-		assert.Fail(t, "a matching stale cache must not confirm a write")
+		assert.Fail(t, "a change whose writes are all dropped must not confirm")
 	}
 	if got := fake.countSet(ampsEntity); got != maxWriteRetries+1 {
-		assert.Failf(t, "assertion failed", "stale cached target must exhaust retries, got %d writes", got)
+		assert.Failf(t, "assertion failed", "a dropped change must exhaust retries, got %d writes", got)
+	}
+}
+
+// TestObserveChargingTrustsLiveFeed proves observeCharging trusts the last-known
+// switch state while the feed is live — a quiescent ON switch reads ChargeOn, not
+// the ChargeUnknown misread that made the watchdog stop every long charge — while
+// a frozen feed (or disconnect) falls back to Unknown so the watchdog fails closed
+// even though the cache still reads a concrete value.
+func TestObserveChargingTrustsLiveFeed(t *testing.T) {
+	fake := newFakeHA()
+	fake.setState(switchEntity, switchOn)
+	a := rawActuator(t, fake, testRates(t), testCfg(t))
+
+	if got := a.ChargingObserved(); got != ChargeOn {
+		assert.Failf(t, "assertion failed", "live-feed ON switch must read ChargeOn, got %v", got)
+	}
+	fake.mu.Lock()
+	fake.fresh[livenessEntity] = false // feed frozen: cache still reads "on" but is no longer trustworthy
+	fake.mu.Unlock()
+	if got := a.ChargingObserved(); got != ChargeUnknown {
+		assert.Failf(t, "assertion failed", "a frozen feed must read ChargeUnknown, got %v", got)
+	}
+}
+
+// TestFeedLiveFallsBackToConnectedWithoutLivenessEntities proves a misconfig with
+// no liveness sensors degrades to the raw connection state rather than wedging
+// every gate false forever: observeCharging trusts a connected switch and goes
+// Unknown only on disconnect.
+func TestFeedLiveFallsBackToConnectedWithoutLivenessEntities(t *testing.T) {
+	fake := newFakeHA()
+	fake.setState(switchEntity, switchOn)
+	cfg := testCfg(t)
+	cfg.LivenessEntities = nil
+	a := rawActuator(t, fake, testRates(t), cfg)
+
+	if got := a.ChargingObserved(); got != ChargeOn {
+		assert.Failf(t, "assertion failed", "no liveness entities + connected ON switch must read ChargeOn, got %v", got)
+	}
+	fake.mu.Lock()
+	fake.connected = false
+	fake.mu.Unlock()
+	if got := a.ChargingObserved(); got != ChargeUnknown {
+		assert.Failf(t, "assertion failed", "no liveness entities + disconnected must read ChargeUnknown, got %v", got)
 	}
 }
 
@@ -717,9 +774,12 @@ func TestWatchdogDisablesTimedChargeOutsideWindow(t *testing.T) {
 func TestWatchdogDisablesOnStaleFeedOutsideWindow(t *testing.T) {
 	a, fake, clock := newActuator(t, ModeLive, inWindow, switchOff)
 	clock.set(outWindow)
+	// Frozen feed: the switch cache still reads a concrete "on", but the feed has
+	// stopped delivering so ownership can't be confirmed — the watchdog must fail
+	// closed and disable rather than trust the stale reading.
 	fake.mu.Lock()
-	fake.fresh[switchEntity] = false
-	fake.states[switchEntity] = "unknown"
+	fake.states[switchEntity] = switchOn
+	fake.fresh[livenessEntity] = false
 	fake.mu.Unlock()
 
 	submitSync(t, a, command{kind: cmdWatchdog})
@@ -780,7 +840,6 @@ func TestWatchdogSafesUnknownChargeInsideWindow(t *testing.T) {
 	a, fake, _ := newActuator(t, ModeLive, inWindow, switchOff)
 	fake.mu.Lock()
 	fake.states[switchEntity] = "unknown"
-	fake.fresh[switchEntity] = false
 	fake.mu.Unlock()
 
 	submitSync(t, a, command{kind: cmdWatchdog})
@@ -853,9 +912,6 @@ func TestReconcileUnknownStartupSafesInLiveButRemainsUnknownInObserve(t *testing
 	liveFake := newFakeHA()
 	seedSafeState(liveFake)
 	liveFake.setState(switchEntity, "unavailable")
-	liveFake.mu.Lock()
-	liveFake.fresh[switchEntity] = false
-	liveFake.mu.Unlock()
 	live, _ := startWith(t, liveFake, ModeLive, inWindow)
 	if liveFake.countService("turn_off") == 0 || live.ChargingObserved() != ChargeOff {
 		assert.Fail(t, "live startup must safe unknown state and require fresh observed off")
@@ -864,9 +920,6 @@ func TestReconcileUnknownStartupSafesInLiveButRemainsUnknownInObserve(t *testing
 	observeFake := newFakeHA()
 	seedSafeState(observeFake)
 	observeFake.setState(switchEntity, "unavailable")
-	observeFake.mu.Lock()
-	observeFake.fresh[switchEntity] = false
-	observeFake.mu.Unlock()
 	observe, _ := startWith(t, observeFake, ModeObserve, inWindow)
 	if observeFake.totalCalls() != 0 || observe.ChargingObserved() != ChargeUnknown {
 		assert.Fail(t, "observe startup cannot safe and must preserve unknown")

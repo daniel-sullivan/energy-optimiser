@@ -437,9 +437,20 @@ type ActuatorHW struct {
 	// spurious retries.
 	ReadBackTimeout Duration `toml:"read_back_timeout"`
 
-	// StateStale marks the timed-charge switch reading stale (→ watchdog disables
-	// it outside a window) past this age.
+	// StateStale is the max age of the live SRNE feed the actuator will still trust
+	// for gating decisions. Freshness is judged on LivenessEntities (the fast-moving
+	// co-published sensors), not the quiescent actuation entities: switches and
+	// setpoints emit no event until they change, so their age says nothing about
+	// feed health. Once every liveness sensor is older than this the feed is treated
+	// as dead and observation falls back to a safe "unknown" (the watchdog then
+	// fails closed).
 	StateStale Duration `toml:"state_stale"`
+
+	// LivenessEntities are the SRNE sensor entities whose freshness proves the feed
+	// is alive (derived from HomeAssistant.Entities in finalizeActuator, not TOML).
+	// They fluctuate every few seconds and all freeze together if the controller
+	// dies, so any one being fresh means a quiescent actuation reading is current.
+	LivenessEntities []string `toml:"-"`
 }
 
 type Circuit struct {
@@ -708,6 +719,22 @@ func (c *Config) finalizeActuator() {
 	}
 	if a.StateDir == "" {
 		a.StateDir = c.PVModel.DataDir
+	}
+	if len(a.LivenessEntities) == 0 {
+		// The fast-moving co-published sensors — freshness on any one proves the SRNE
+		// feed is alive, so a quiescent actuation reading can be trusted (see
+		// ActuatorHW.LivenessEntities / actuator.feedLive).
+		for _, e := range []string{
+			c.HomeAssistant.Entities.BatteryPower,
+			c.HomeAssistant.Entities.GridPower,
+			c.HomeAssistant.Entities.LoadPower,
+			c.HomeAssistant.Entities.PVPower,
+			c.HomeAssistant.Entities.BatterySOC,
+		} {
+			if e != "" {
+				a.LivenessEntities = append(a.LivenessEntities, e)
+			}
+		}
 	}
 	if a.WatchdogInterval.Duration == 0 {
 		a.WatchdogInterval.Duration = 30 * time.Second

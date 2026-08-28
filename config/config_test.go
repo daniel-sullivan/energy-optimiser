@@ -158,6 +158,11 @@ func TestParse(t *testing.T) {
 	if len(cfg.ActuatorHW.ChargeWindows) != 3 {
 		t.Errorf("charge_windows default = %d, want 3", len(cfg.ActuatorHW.ChargeWindows))
 	}
+	// LivenessEntities is derived from the configured (non-empty) SRNE sensors —
+	// battery_power is unset here, so the other four are collected.
+	if got := cfg.ActuatorHW.LivenessEntities; len(got) != 4 || got[0] != "sensor.grid_power" || got[3] != "sensor.battery_soc" {
+		t.Errorf("liveness_entities derived = %v, want [grid_power load_power pv_power battery_soc]", got)
+	}
 }
 
 func TestRateAt(t *testing.T) {
